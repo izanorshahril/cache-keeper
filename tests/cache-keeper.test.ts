@@ -191,6 +191,28 @@ test('the band draws usage and cache state on every surface', async ($, on) => {
   }
 })
 
+test('after a restart the band shows the last usage until a new reply reports it', async ($, on) => {
+  const later = new Date(1000 + 2 * HOUR).toISOString()
+  const past = new Date(500).toISOString()
+
+  mock.clock(on, { now: 1000 })
+  mock.store(on, {
+    rate: [
+      { kind: 'five_hour', percentUsed: 90, resetsAt: later },
+      { kind: 'seven_day', percentUsed: 40, resetsAt: past },
+    ],
+  })
+  standIn(on, () => {})
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+
+  expect((await ui.find({ type: 'Text', text: /LOW/ }))?.text).toContain('10% left')
+  expect((await ui.find({ type: 'Text', text: /60% left/ }))).toBeUndefined()
+  await ui.unmount()
+})
+
 test('a cold send asks, and "Don\'t send" puts the text back', { options: { autoCompact: 'off' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1000 })
   let filled = ''

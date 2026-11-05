@@ -31,6 +31,7 @@ const MAX_PING_RETRIES = 3
 const STALE_AFTER_MS = 7 * 24 * HOUR
 const ATTENDED = new Set<string>(['composer', 'bridge', 'sdk'])
 
+const RATE_KEY = 'rate'
 const sessionKey = (id: string) => `session:${id}`
 
 async function patch($: EngineInterface, change: (value: Core) => Core): Promise<void> {
@@ -69,6 +70,17 @@ async function measure($: EngineInterface): Promise<void> {
   await update($, rate, () =>
     usage.rateLimits.map(({ kind, percentUsed, resetsAt }) => ({ kind, percentUsed, ...(resetsAt ? { resetsAt } : {}) })),
   )
+
+  if (usage.rateLimits.length > 0) {
+    await $.store.set(RATE_KEY, await read($, rate))
+  } else {
+    // A new session has no reading until its first reply, so show the last one saved.
+    const now = await $.clock.now()
+    const saved = ((await $.store.get(RATE_KEY)) ?? []) as RateRow[]
+
+    await update($, rate, () => saved.filter(row => row.resetsAt !== undefined && Date.parse(row.resetsAt) > now))
+  }
+
   await patch($, c => ({
     ...c,
     model: model || c.model,
