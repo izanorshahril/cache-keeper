@@ -213,6 +213,25 @@ test('after a restart the band shows the last usage until a new reply reports it
   await ui.unmount()
 })
 
+test('a running session picks up the reading another session saved', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
+  let saved: unknown
+
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'rate' ? saved : undefined }) as never)
+  on('store.set', () => ({ value: undefined }) as never)
+  on('store.keys', () => ({ value: [] }) as never)
+  standIn(on as never, () => {})
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  saved = [{ kind: 'five_hour', percentUsed: 90, resetsAt: new Date(1000 + 2 * HOUR).toISOString() }]
+  await clock.advance(MINUTE)
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+
+  expect((await ui.find({ type: 'Text', text: /LOW/ }))?.text).toContain('10% left')
+  await ui.unmount()
+})
+
 test('a cold send asks, and "Don\'t send" puts the text back', { options: { autoCompact: 'off' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1000 })
   let filled = ''

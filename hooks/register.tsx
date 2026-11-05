@@ -62,23 +62,30 @@ let nextPingAt = 0
 let pingRetries = 0
 let cancelTick: (() => void) | null = null
 
+/**
+ * Usage is the account's, not the session's, so every session shows the newest
+ * reading any of them saved: a session has none of its own until its first reply.
+ */
+async function loadSavedRate($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  const saved = ((await $.store.get(RATE_KEY)) ?? []) as RateRow[]
+  const rows = saved.filter(row => row.resetsAt !== undefined && Date.parse(row.resetsAt) > now)
+
+  if (JSON.stringify(rows) !== JSON.stringify(await read($, rate))) await update($, rate, () => rows)
+}
+
 async function measure($: EngineInterface): Promise<void> {
   const usage = await $.session.usage()
   const model = await $.session.model()
   const tokens = usage.context.tokens
 
-  await update($, rate, () =>
-    usage.rateLimits.map(({ kind, percentUsed, resetsAt }) => ({ kind, percentUsed, ...(resetsAt ? { resetsAt } : {}) })),
-  )
-
   if (usage.rateLimits.length > 0) {
-    await $.store.set(RATE_KEY, await read($, rate))
-  } else {
-    // A new session has no reading until its first reply, so show the last one saved.
-    const now = await $.clock.now()
-    const saved = ((await $.store.get(RATE_KEY)) ?? []) as RateRow[]
+    const rows = usage.rateLimits.map(({ kind, percentUsed, resetsAt }) => ({ kind, percentUsed, ...(resetsAt ? { resetsAt } : {}) }))
 
-    await update($, rate, () => saved.filter(row => row.resetsAt !== undefined && Date.parse(row.resetsAt) > now))
+    await update($, rate, () => rows)
+    await $.store.set(RATE_KEY, rows)
+  } else {
+    await loadSavedRate($)
   }
 
   await patch($, c => ({
@@ -153,6 +160,8 @@ async function tick($: EngineInterface, options: Options): Promise<void> {
   isBusy = true
 
   try {
+    await loadSavedRate($)
+
     const now = await $.clock.now()
     const value = await read($, core)
     const action = decide({ now, core: value, options, isTurnRunning, nextPingAt })
