@@ -4,6 +4,8 @@ A Claude Code mod that makes an idle session cheap to come back to.
 It combines the ideas of [ribbon](https://github.com/robonuggets/ribbon) and [cache-tax](https://github.com/karanb192/cache-tax) (both MIT) with an auto compact of its own.
 The code and mascot art are written here; none is copied from either project.
 
+![The band counting down, compacting, then going cold](media/cache-keeper.gif)
+
 | Part | From | What it does |
 | --- | --- | --- |
 | Band above the prompt | ribbon | 7D and 5H usage left with reset times, then the mascot, cache state, next-message cost and when compaction runs. |
@@ -43,6 +45,14 @@ The desktop app, VS Code and mobile draw it from SVG in [hooks/art.ts](hooks/art
 | Warm | Green | Bobs and blinks with rising embers; hover to make it hop and wave (desktop and mobile) |
 | Cold | Pale blue | Frozen in an ice block with falling snow; hover to make it shiver (desktop and mobile) |
 | Compacted | Lilac | Naps with drifting Zs |
+
+![Warm](media/band-warm.png)
+![Cold](media/band-cold.png)
+![Compacted](media/band-compacted.png)
+![Low usage](media/band-low-usage.png)
+
+These images use example figures.
+[assets/capture.ts](assets/capture.ts) rebuilds them from the real drawings, using Bun and headless Edge; ffmpeg encodes the GIF.
 
 All motion is CSS, so the system's reduced-motion setting stops it.
 Text uses Outfit, embedded as a subset under the SIL Open Font License ([assets/OFL.txt](assets/OFL.txt)); [assets/build-font.py](assets/build-font.py) rebuilds `hooks/font.ts`.

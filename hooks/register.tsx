@@ -437,14 +437,14 @@ export const register: Register = (on, rawOptions) => {
             <Svg source={usage.source} alt={usageAlt} width={usage.width} height={usage.height} />
           </Box>
         ) : null}
-        {figure && cache ? (
-          <Box key="figure" flexShrink={0} marginRight={1}>
-            <Svg source={figure.source} alt={cache.summary} width={figure.width} height={figure.height} isInteractive />
-          </Box>
-        ) : null}
-        {status && cache ? (
-          <Box key="status" flexShrink={0}>
-            <Svg source={status.source} alt={cache.summary} width={status.width} height={status.height} />
+        {figure && status && cache ? (
+          <Box key="cache" flexDirection="row" alignItems="center" flexShrink={0}>
+            <Box key="figure" flexShrink={0} marginRight={1}>
+              <Svg source={figure.source} alt={cache.summary} width={figure.width} height={figure.height} isInteractive />
+            </Box>
+            <Box key="status" flexShrink={0}>
+              <Svg source={status.source} alt={cache.summary} width={status.width} height={status.height} />
+            </Box>
           </Box>
         ) : null}
       </Box>

@@ -85,12 +85,12 @@ function usageDots(part: RatePart, cells: number, x: number, index: number): str
       const delay = (i * 0.09 + index * 0.4).toFixed(2)
 
       svg +=
-        `<circle class="dot" cx="${cx}" cy="${MID}" r="3" fill="url(#g${index})" filter="url(#glow)"` +
+        `<circle class="dot" cx="${cx}" cy="${MID}" r="3" fill="${color}" filter="url(#glow)"` +
         ` opacity="${Math.max(0.35, fill).toFixed(2)}" style="animation-delay:${delay}s"/>`
     }
   }
 
-  return `<linearGradient id="g${index}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".55"/><stop offset=".45" stop-color="${color}"/></linearGradient>${svg}`
+  return svg
 }
 
 /** USAGE, then each window's dots, percent left and reset time, coloured by how much is left. */
@@ -142,27 +142,29 @@ export function statusSvg(cache: CacheParts): Drawing {
   const word = WORD[cache.mode]
   const chipWidth = Math.ceil(widthOf(word, 12, 1) + 18)
   const chipHeight = 20
-  const top = 3
-  const y = 17.5
+  // Room around the chip, so its glow fades out inside the drawing.
+  const left = 7
+  const top = 7
+  const y = 21.5
   const text = runs(
     [
       { text: cache.time, size: 13.5, weight: 700, fill: hue },
       ...(cache.cost ? [{ text: `· ${cache.cost}`, size: 13.5, weight: 700, fill: TEXT, gap: 5 }] : []),
       ...(cache.plan ? [{ text: `· ${cache.plan}`, size: 12.5, weight: 500, fill: MUTED, gap: 5 }] : []),
     ],
-    chipWidth + 8,
+    left + chipWidth + 8,
     y,
   )
   const width = Math.ceil(text.end + 2)
-  const height = 26
+  const height = 34
   const css =
     '.chip{animation:halo 2.8s ease-in-out infinite}@keyframes halo{50%{filter:drop-shadow(0 0 3.5px ' + hue + ')}}' +
     '.sweep{animation:sweep 4.5s ease-in-out infinite}@keyframes sweep{0%,55%{transform:translateX(-30px)}100%{transform:translateX(' + (chipWidth + 30) + 'px)}}'
   const body =
-    `<defs><clipPath id="c"><rect y="${top}" width="${chipWidth}" height="${chipHeight}" rx="6.5"/></clipPath></defs>` +
-    `<g class="chip"><rect y="${top}" width="${chipWidth}" height="${chipHeight}" rx="6.5" fill="${hue}"/></g>` +
-    `<g clip-path="url(#c)"><path class="sweep" d="M0 ${top + chipHeight}L10 ${top}h9L9 ${top + chipHeight}z" fill="#fff" opacity=".4"/></g>` +
-    `<text x="${chipWidth / 2}" y="${top + 14.2}" font-size="12" font-weight="700" letter-spacing="1" text-anchor="middle" fill="${INK}">${word}</text>` +
+    `<defs><clipPath id="c"><rect x="${left}" y="${top}" width="${chipWidth}" height="${chipHeight}" rx="6.5"/></clipPath></defs>` +
+    `<g class="chip"><rect x="${left}" y="${top}" width="${chipWidth}" height="${chipHeight}" rx="6.5" fill="${hue}"/></g>` +
+    `<g clip-path="url(#c)"><path class="sweep" d="M${left} ${top + chipHeight}L${left + 10} ${top}h9L${left + 9} ${top + chipHeight}z" fill="#fff" opacity=".4"/></g>` +
+    `<text x="${left + chipWidth / 2}" y="${top + 14.2}" font-size="12" font-weight="700" letter-spacing="1" text-anchor="middle" fill="${INK}">${word}</text>` +
     text.svg
 
   return { source: doc(width, height, css, body, true), width, height }
