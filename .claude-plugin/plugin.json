@@ -1,0 +1,38 @@
+{
+  "name": "cache-keeper",
+  "version": "0.1.0",
+  "description": "Band with usage left and prompt-cache state, a cold-send guard, optional keepwarm, and one auto-compact before an idle session's cache goes cold.",
+  "author": { "name": "izanorshahril" },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoCompact": {
+      "type": "string",
+      "title": "Auto compact",
+      "description": "Compact once when the session idles, shortly before the cache goes cold.",
+      "options": ["on", "off"],
+      "default": "on"
+    },
+    "guard": {
+      "type": "string",
+      "title": "Cold-send guard",
+      "description": "Before a message that re-writes a large cold cache: ask, log the estimate, or do nothing.",
+      "options": ["ask", "warn", "off"],
+      "default": "ask"
+    },
+    "cacheTtl": {
+      "type": "string",
+      "title": "Prompt cache TTL",
+      "description": "The cache lifetime this session runs on: 1h on included subscription usage, 5m on most API-key sessions.",
+      "options": ["1h", "5m"],
+      "default": "1h"
+    },
+    "minTokens": {
+      "type": "string",
+      "title": "Large-context floor",
+      "description": "Context size, in tokens, below which neither auto compact nor the guard acts.",
+      "options": ["20000", "50000", "100000", "200000"],
+      "default": "50000"
+    }
+  }
+}
