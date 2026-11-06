@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { MODE_HUE, mascotSvg, statusSvg, usageSvg } from '../hooks/art'
-import { EMPTY, HOUR, MINUTE, cacheParts, planStateOf, compactAtMs, decide, estimates, builtinIdle, isHeadlessRefusal, needsWarning, nextCost, resolveModel, switchTargets, parseDuration, parseOptions, priceOf, rateParts, toneOf } from '../hooks/logic'
+import { CHOICE_HUE, EMPTY, wantsAwake, HOUR, MINUTE, cacheParts, coldCase, coldChoices, compactModels, planStateOf, compactAtMs, decide, estimates, builtinIdle, isHeadlessRefusal, lowerModels, needsWarning, nextCost, resolveModel, parseDuration, parseOptions, priceOf, rateParts, toneOf } from '../hooks/logic'
 
 const options = parseOptions({ autoCompact: 'on' })
 const warm = { ...EMPTY, lastAt: 1000, tokens: 180_000, model: 'claude-opus-5-5', byModel: { 'opus-5-5': 1000 }, armed: true }
@@ -63,9 +63,9 @@ test('the cache parts say warm, cold and compacted, priced on the selected model
     mode: 'warm',
     time: '50m left',
     cost: 'Opus $0.04',
-    plan: 'auto compact in 45m',
+    plan: 'idle compact in 45m',
   })
-  expect(cacheParts(warm, at(2 * HOUR), options, opus)).toMatchObject({ mode: 'cold', time: '2h 0m', cost: 'Opus $1.44', plan: 'auto compact on' })
+  expect(cacheParts(warm, at(2 * HOUR), options, opus)).toMatchObject({ mode: 'cold', time: '2h 0m', cost: 'Opus $1.44', plan: 'idle compact on' })
   expect(cacheParts({ ...warm, compacted: true, tokens: 12_000 }, at(0), options, opus)).toMatchObject({
     mode: 'compacted',
     time: '12k',
@@ -117,20 +117,50 @@ test('a model with no reply recorded here is shown as not recorded', () => {
   expect(cacheParts(fresh, at(MINUTE), options, 'claude-haiku-5-5')).toMatchObject({ mode: 'cold', time: 'not recorded' })
 })
 
-test('the warning is for Opus and Sonnet with a cold cache, never Haiku', () => {
+test('the warning is for any model with a cold cache, Haiku too', () => {
   const cold = at(2 * HOUR)
   const big = { ...warm, tokens: 400_000 }
 
   expect(needsWarning(big, 'claude-opus-5-5', cold, options)).toBe(true)
   expect(needsWarning(big, 'claude-sonnet-5-5', cold, options)).toBe(true)
-  expect(needsWarning(big, 'claude-haiku-5-5', cold, options)).toBe(false)
+  expect(needsWarning(big, 'claude-haiku-5-5', cold, options)).toBe(true)
   expect(needsWarning(big, 'claude-opus-5-5', at(MINUTE), options)).toBe(false)
   expect(needsWarning({ ...big, tokens: 1000 }, 'claude-opus-5-5', cold, options)).toBe(false)
 })
 
-test('the switch options are the other models', () => {
-  expect(switchTargets('claude-opus-5-5')).toEqual(['claude-haiku-5-5', 'claude-sonnet-5-5'])
-  expect(switchTargets('claude-sonnet-5-5')).toEqual(['claude-haiku-5-5'])
+test('each of the four cold cases offers its own choices', () => {
+  const opus = 'claude-opus-5-5'
+  const haiku = 'claude-haiku-5-5'
+
+  expect(coldCase(opus, 'claude-fable-5-1')).toBe('large-large')
+  expect(coldCase(opus, haiku)).toBe('large-haiku')
+  expect(coldCase(haiku, opus)).toBe('haiku-large')
+  expect(coldCase(haiku, haiku)).toBe('haiku-haiku')
+  expect(coldCase('', opus)).toBe('large-large')
+
+  expect(coldChoices('large-large', opus)).toEqual(['send', 'switch', 'compact', 'cancel'])
+  expect(coldChoices('large-haiku', haiku)).toEqual(['send', 'compact', 'cancel'])
+  expect(coldChoices('haiku-large', opus)).toEqual(['send', 'compact', 'cancel'])
+  expect(coldChoices('haiku-haiku', haiku)).toEqual(['send', 'cancel'])
+
+  expect([CHOICE_HUE.send, CHOICE_HUE.switch, CHOICE_HUE.compact, CHOICE_HUE.cancel]).toEqual(['error', 'warning', 'warning', undefined])
+})
+
+test('a lower model is any family below; compaction picks any model only from large to large', () => {
+  expect(lowerModels('claude-fable-5-1')).toEqual(['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'])
+  expect(lowerModels('claude-sonnet-5-5')).toEqual(['claude-haiku-5-5'])
+  expect(lowerModels('claude-haiku-5-5')).toEqual([])
+  expect(compactModels('large-large', 'claude-opus-5-5')).toEqual(['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-fable-5-1'])
+  expect(compactModels('large-haiku', 'claude-haiku-5-5')).toEqual(['claude-haiku-5-5'])
+  expect(compactModels('haiku-large', 'claude-opus-5-5')).toEqual(['claude-haiku-5-5'])
+})
+
+test('a machine asleep past the cache life does not compact on waking', () => {
+  // Asleep 32m into the idle, awake 5h 51m after the last reply: the cache is gone, so no compaction.
+  expect(idle(at(32 * MINUTE))).toBe('none')
+  expect(idle(at(5 * HOUR + 51 * MINUTE))).toBe('none')
+  // Awake again inside the window, it still compacts while the cache serves it.
+  expect(idle(at(57 * MINUTE))).toBe('compact')
 })
 
 test('a model name the price table does not list means the model of the last reply', () => {
@@ -193,19 +223,22 @@ const COMPLETE = {
   },
 }
 
-const standIn = (on: never, compact: () => string | void, rateLimits: unknown[] = [], model = 'claude-opus-5-5') => {
+const standIn = (on: never, compact: () => string | void, rateLimits: unknown[] = [], model: string | (() => string) = 'claude-opus-5-5', box: () => string = () => '', log: (text: string) => void = () => {}) => {
   on('command.register', () => ({ value: { command: 'x' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 's1' }))
-  on('session.model', () => ({ value: model }))
+  on('session.model', () => ({ value: typeof model === 'function' ? model() : model }))
   on('session.usage', () => ({
     value: { startedAt: 0, context: { tokens: 180_000, window: 1_000_000 }, rateLimits },
   }))
   on('agent.list', () => ({ value: [] }))
-  on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
+  on('prompt.read', () => ({ value: { text: box(), cursor: 0 } }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
   on('turn.complete', () => ({ text: '' }) as never)
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', (_, e) => {
+    log((e as { text: string }).text)
+    return { value: undefined }
+  })
   on('session.messages', () => ({ value: [SUMMARY] }))
   on('session.compact', () => {
     const skip = compact()
@@ -263,7 +296,8 @@ test('the band draws usage and cache state on every surface', { options: { autoC
 
   expect((await terminal.find({ type: 'Text', text: /LOW/ }))?.text).toContain('10% left')
   expect((await terminal.find({ type: 'Text', text: /Cache warm/ }))?.text).toContain('1h 0m left')
-  expect((await terminal.find({ type: 'Text', text: /compact/ }))?.text).toContain('◷ auto compact in 55m')
+  expect((await terminal.find({ type: 'Text', text: /compact/ }))?.text).toContain('◷ idle compact in 55m')
+  expect((await terminal.find({ type: 'Text', text: /keep awake/ }))?.text).toBe(' · ○ keep awake off')
   await terminal.unmount()
 
   // Any tree a surface refuses fails the mount, so this covers each surface's table.
@@ -315,32 +349,193 @@ test('a running session picks up the reading another session saved', async ($, o
   await ui.unmount()
 })
 
-test('a cold send asks, and "Don\'t send" puts the text back', { options: { autoCompact: 'off' } }, async ($, on) => {
+/** A session whose cache on `model` went cold two hours ago, with stand-ins that record what the guard does. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function coldSession($: any, on: any, model = 'claude-opus-5-5', answers: string[] = []) {
   const clock = mock.clock(on, { now: 1000 })
-  let filled = ''
+  const seen = { filled: '', runs: [] as string[], sent: [] as string[], compactions: 0, asked: [] as string[], logs: [] as string[], model, clock }
 
   mock.store(on)
-  standIn(on, () => {})
-  on('tool.call', (_, e) => {
-    const question = (e as unknown as { questions: { question: string }[] }).questions[0]?.question ?? ''
+  standIn(
+    on,
+    () => {
+      seen.compactions += 1
+    },
+    [],
+    () => seen.model,
+    () => seen.filled,
+    text => seen.logs.push(text),
+  )
+  on('tool.call', (_: unknown, e: { questions: { question: string }[] }) => {
+    const question = e.questions[0]?.question ?? ''
 
-    return { result: { questions: [], answers: { [question]: "Don't send" } } } as never
+    seen.asked.push(question)
+    return { result: { questions: [], answers: { [question]: answers.shift() ?? 'Cancel' } } }
   })
-  on('prompt.fill', (_, e) => {
-    filled = (e as { text: string }).text
-    return { isFilled: true, text: filled, cursor: 0 } as never
+  on('prompt.fill', (_: unknown, e: { text: string }) => {
+    seen.filled = e.text
+    return { isFilled: true, text: e.text, cursor: 0 }
   })
-  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('command.run', (_: unknown, e: { command: string; args: string }) => {
+    seen.runs.push(`${e.command} ${e.args}`.trim())
+    if (e.command === 'model') seen.model = e.args
+    return { text: '' }
+  })
+  on('prompt.submit', (_: unknown, e: { text: string }) => {
+    seen.sent.push(e.text)
+    return { text: e.text }
+  })
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await $.turn.start({ text: 'hi', turnId: 't1' } as never)
-  await $.turn.complete(COMPLETE as never)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.turn.complete({ ...COMPLETE, usage: { ...COMPLETE.usage, model } })
   await clock.advance(2 * HOUR)
 
-  const result = await $.prompt.submit({ text: 'back again', origin: { kind: 'composer' }, wait: false } as never)
+  return seen
+}
 
-  expect((result as { drop?: string }).drop).toContain('not sent')
-  expect(filled).toBe('back again')
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const send = ($: any, text: string, kind = 'composer') => $.prompt.submit({ text, origin: { kind }, wait: false }) as Promise<{ drop?: string; text?: string }>
+const buttons = async (ui: { findAll: (q: object) => Promise<{ key: string | undefined; props: Record<string, unknown> }[]> }) =>
+  (await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('cold-'))
+
+test('a cold send from large to large holds the text and asks in the band, colored', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on)
+  const result = await send($, 'back again')
+
+  expect(result.drop).toContain('pick how to send it')
+  expect(seen.filled).toBe('back again')
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+
+  expect((await buttons(ui)).map(b => b.props.label)).toEqual([expect.stringMatching(/^Continue on Opus \(\$/), 'Continue on a lower model', 'Compact first', 'Cancel'])
+  expect((await ui.find({ type: 'Text', text: /^Continue on Opus/ }))?.props.color).toBe('error')
+  expect((await ui.find({ type: 'Text', text: 'Continue on a lower model' }))?.props.color).toBe('warning')
+  expect((await ui.find({ type: 'Text', text: 'Compact first' }))?.props.color).toBe('warning')
+
+  for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
+    const other = await $.ui.mount({ ...(BAND as object), surface } as never)
+
+    expect((await buttons(other)).map(b => b.key)).toEqual(['cold-send', 'cold-switch', 'cold-compact', 'cold-cancel'])
+    await other.unmount()
+  }
+
+  // Cancel leaves the text in the box and sends nothing.
+  await ui.press({ key: 'cold-cancel' })
+  expect(await buttons(ui)).toEqual([])
+  expect(seen.sent).toEqual([])
+  expect(seen.filled).toBe('back again')
+  await ui.unmount()
+})
+
+test('continuing on a lower model picks the model and the effort, then sends', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on)
+
+  await send($, 'go on')
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+
+  await ui.press({ key: 'cold-switch' })
+  expect((await buttons(ui)).map(b => b.key)).toEqual(['cold-model-sonnet-5-5', 'cold-model-haiku-5-5', 'cold-cancel'])
+  await ui.press({ key: 'cold-model-haiku-5-5' })
+  expect((await buttons(ui)).map(b => b.key)).toEqual(['cold-effort-low', 'cold-effort-medium', 'cold-effort-high', 'cold-effort-xhigh', 'cold-effort-max', 'cold-cancel'])
+  await ui.press({ key: 'cold-effort-max' })
+
+  expect(seen.runs).toEqual(['model claude-haiku-5-5', 'effort max'])
+  expect(seen.sent.at(-1)).toBe('go on')
+  expect(seen.filled).toBe('')
+  await ui.unmount()
+})
+
+test('compacting first runs on the model and effort picked, then sends on the model typed for', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on)
+
+  await send($, 'go on')
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+
+  await ui.press({ key: 'cold-compact' })
+  expect((await buttons(ui)).map(b => b.key)).toEqual(['cold-model-haiku-5-5', 'cold-model-sonnet-5-5', 'cold-model-opus-5-5', 'cold-model-fable-5-1', 'cold-cancel'])
+  await ui.press({ key: 'cold-model-haiku-5-5' })
+  await ui.press({ key: 'cold-effort-low' })
+
+  expect(seen.compactions).toBe(1)
+  expect(seen.runs).toEqual(['model claude-haiku-5-5', 'effort low', 'model claude-opus-5-5'])
+  expect(seen.model).toBe('claude-opus-5-5')
+  expect(seen.sent.at(-1)).toBe('go on')
+  await ui.unmount()
+})
+
+test('from large to Haiku, compact first runs on Haiku with no more picks', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on)
+
+  seen.model = 'claude-haiku-5-5'
+  await send($, 'go on')
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+
+  expect((await buttons(ui)).map(b => b.props.label)).toEqual([expect.stringMatching(/^Continue on Haiku/), expect.stringMatching(/^Compact on Haiku first/), 'Cancel'])
+  await ui.press({ key: 'cold-compact' })
+
+  expect(seen.compactions).toBe(1)
+  // Already on Haiku: no switch either way.
+  expect(seen.runs).toEqual([])
+  expect(seen.sent.at(-1)).toBe('go on')
+  await ui.unmount()
+})
+
+test('from Haiku to a larger model, compact first runs on Haiku and sends on the larger one', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-haiku-5-5')
+
+  seen.model = 'claude-opus-5-5'
+  await send($, 'go on')
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+
+  expect((await buttons(ui)).map(b => b.props.label)).toEqual([expect.stringMatching(/^Continue on Opus/), expect.stringMatching(/^Compact on Haiku first/), 'Cancel'])
+  await ui.press({ key: 'cold-compact' })
+
+  expect(seen.compactions).toBe(1)
+  expect(seen.runs).toEqual(['model claude-haiku-5-5', 'model claude-opus-5-5'])
+  expect(seen.sent.at(-1)).toBe('go on')
+  await ui.unmount()
+})
+
+test('from Haiku to Haiku the band offers only continue and cancel', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-haiku-5-5')
+
+  await send($, 'go on')
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+
+  expect((await buttons(ui)).map(b => b.key)).toEqual(['cold-send', 'cold-cancel'])
+  await ui.press({ key: 'cold-send' })
+  expect(seen.runs).toEqual([])
+  expect(seen.sent.at(-1)).toBe('go on')
+  await ui.unmount()
+})
+
+test('a Remote Control send asks in the engine box, in steps', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-opus-5-5', ['Continue on a lower model', 'Haiku ($0.18)', 'max'])
+  const result = await send($, 'from my phone', 'bridge')
+
+  expect(result.drop).toContain('switching to Haiku')
+
+  for (let i = 0; i < 5 && seen.sent.length < 2; i += 1) await seen.clock.advance(1)
+
+  expect(seen.asked).toHaveLength(3)
+  expect({ runs: seen.runs, logs: seen.logs }).toEqual({ runs: ['model claude-haiku-5-5', 'effort max'], logs: [] })
+  expect(seen.sent.at(-1)).toBe('from my phone')
+})
+
+test('the same text sent again while the band asks opens the engine box instead', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-opus-5-5', ['Cancel'])
+
+  await send($, 'again')
+  const result = await send($, 'again')
+
+  expect(seen.asked).toHaveLength(1)
+  expect(result.drop).toContain('not sent')
 })
 
 test('a restart keeps the Haiku cache warm when the resume hook runs before session start', async ($, on) => {
@@ -384,17 +579,17 @@ test('the band names idle compaction, with a timer only when one will fire', () 
   expect(plan(warm, builtin)).toBe('idle compact on')
   expect(plan(big, builtin, 2 * HOUR)).toBe('idle compact on')
 
-  expect(plan(warm, options)).toBe('auto compact in 45m')
-  expect(plan({ ...warm, armed: false }, options)).toBe('auto compact on')
-  expect(plan({ ...warm, tokens: 1000 }, options)).toBe('auto compact on')
+  expect(plan(warm, options)).toBe('idle compact in 45m')
+  expect(plan({ ...warm, armed: false }, options)).toBe('idle compact on')
+  expect(plan({ ...warm, tokens: 1000 }, options)).toBe('idle compact on')
   expect(plan({ ...warm, noCompact: true }, off)).toBe('idle compact off')
-  expect(plan(warm, parseOptions({ autoCompact: 'on', compactAfter: '30m' }))).toBe('auto compact in 20m')
+  expect(plan(warm, parseOptions({ autoCompact: 'on', compactAfter: '30m' }))).toBe('idle compact in 20m')
   expect(plan({ ...warm, keepUntil: at(HOUR) }, options)).toBe('keepwarm 50m')
   expect(parseOptions({ compactAfter: '2h' }).compactAt).toBe(59 * MINUTE)
 })
 
 test('each compaction line has its own icon state', () => {
-  expect(['idle compact in 44m', 'auto compact in 5m', 'keepwarm 50m', 'idle compact on', 'auto compact on', 'idle compact off'].map(planStateOf)).toEqual([
+  expect(['idle compact in 44m', 'idle compact in 5m', 'keepwarm 50m', 'idle compact on', 'idle compact on', 'idle compact off'].map(planStateOf)).toEqual([
     'timer',
     'timer',
     'timer',
@@ -430,4 +625,111 @@ test('a compaction the engine skips is tried again, and says so', { options: { a
 
   await clock.advance(3 * MINUTE)
   expect(attempts).toBe(2)
+})
+
+test('keep awake holds only while an idle compaction or keepwarm waits on a warm cache', () => {
+  const on = { ...options, keepAwake: true }
+  const builtin = { ...on, autoCompact: false, builtin: { minTokens: 100_000, fireAt: 0.9 } }
+
+  expect(wantsAwake(warm, at(30 * MINUTE), on)).toBe(true)
+  expect(wantsAwake(warm, at(30 * MINUTE), { ...on, keepAwake: false })).toBe(false)
+  // Compacted, tried, or cold: nothing left for waking to save.
+  expect(wantsAwake({ ...warm, compacted: true }, at(30 * MINUTE), on)).toBe(false)
+  expect(wantsAwake({ ...warm, compactTried: true }, at(30 * MINUTE), on)).toBe(false)
+  expect(wantsAwake(warm, at(HOUR), on)).toBe(false)
+  // No compaction on at all: no hold, unless keepwarm is armed.
+  expect(wantsAwake(warm, at(30 * MINUTE), { ...on, autoCompact: false })).toBe(false)
+  expect(wantsAwake({ ...warm, keepUntil: at(2 * HOUR) }, at(30 * MINUTE), { ...on, autoCompact: false })).toBe(true)
+  // Claude Code's own idle compaction counts too.
+  expect(wantsAwake(warm, at(30 * MINUTE), builtin)).toBe(true)
+  expect(wantsAwake({ ...warm, tokens: 90_000 }, at(30 * MINUTE), builtin)).toBe(false)
+})
+
+/** Stand-ins for the band-switch tests: Windows, a helper that ends at once, and Claude Code's files. */
+function switchSession($: any, on: any, files: Record<string, string> = {}) {
+  const clock = mock.clock(on, { now: 1000 })
+  const seen = { spawned: [] as string[], logs: [] as string[], files, clock }
+
+  mock.store(on)
+  standIn(on as never, () => {}, [], 'claude-opus-5-5', () => '', text => seen.logs.push(text))
+  on('env.get', (_: unknown, e: { name: string }) => ({ value: ({ OS: 'Windows_NT', HOME: '/home/u' } as Record<string, string>)[e.name] }))
+  // The engine resolves a path against the working directory: compare without the drive.
+  const bare = (path: string) => path.replaceAll('\\', '/').replace(/^[A-Za-z]:/, '')
+  on('fs.read', (_: unknown, e: { path: string }) => {
+    if (!(bare(e.path) in seen.files)) throw new Error(`ENOENT ${e.path}`)
+    return { value: seen.files[bare(e.path)] }
+  })
+  on('fs.write', (_: unknown, e: { path: string; text: string }) => {
+    seen.files[bare(e.path)] = e.text
+    return { value: undefined }
+  })
+  // A helper that ends at once stands for one that is not installed.
+  on('process.spawn', async function* (_: unknown, e: { argv: string[] }) {
+    seen.spawned.push(e.argv[0] ?? '')
+    yield* []
+    return { value: { code: 1, signal: null } }
+  })
+
+  return seen
+}
+
+async function start($: any, clock: { advance: (ms: number) => Promise<void> }) {
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.turn.complete(COMPLETE)
+  await clock.advance(MINUTE)
+}
+
+// The engine's `/cache-keeper` lines, as the person reads them.
+const run = async ($: any, args: string) => (await $.command.run({ command: 'cache-keeper', args })) as { text: string }
+
+test('keep awake is set by command and shown on the status line, for every session', { options: { autoCompact: 'on' } }, async ($, on) => {
+  const seen = switchSession($, on)
+
+  await start($, seen.clock)
+
+  const terminal = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
+  const status = async () => (await terminal.find({ type: 'Text', text: /keep awake/ }))?.text
+
+  expect(await status()).toBe(' · ○ keep awake off')
+  // No switches on the band any more: status only.
+  expect(await terminal.findAll({ type: 'Button' })).toEqual([])
+
+  expect((await run($, 'awake on')).text).toContain('Keep awake is on')
+  expect(await status()).toBe(' · ● keep awake on')
+  // A warm cache with a compaction waiting: the hold starts with pwsh, then falls back to Windows PowerShell.
+  for (let i = 0; i < 5 && seen.spawned.length < 2; i += 1) await seen.clock.advance(1)
+  expect(seen.spawned).toEqual(['pwsh', 'powershell'])
+  expect(seen.logs.some(line => line.includes('keep awake found no helper'))).toBe(true)
+  await terminal.unmount()
+
+  // A new session start reads it back from the store.
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const desktop = await $.ui.mount({ ...(BAND as object), surface: 'desktop' } as never)
+  const svgs = await desktop.findAll({ type: 'Svg' })
+
+  expect(svgs.some(svg => String(svg.props.source).includes('keep awake on'))).toBe(true)
+  // The idle compaction clock is back on the status line.
+  expect(svgs.some(svg => String(svg.props.source).includes('idle compact in'))).toBe(true)
+  await desktop.unmount()
+
+  expect((await run($, 'awake off')).text).toBe('Keep awake is off.')
+  expect((await run($, 'sideways')).text).toBe('Usage: /cache-keeper [compact|awake|motion on|off]')
+})
+
+test('motion off by command freezes every drawing', { options: { autoCompact: 'on' } }, async ($, on) => {
+  const seen = switchSession($, on)
+
+  await start($, seen.clock)
+
+  const ui = await $.ui.mount({ ...(BAND as object), surface: 'desktop' } as never)
+  const frozen = async () => (await ui.findAll({ type: 'Svg' })).map(svg => String(svg.props.source).includes('svg *{animation:none!important}'))
+
+  expect(await frozen()).toEqual([false, false])
+  expect((await run($, 'motion off')).text).toBe("The band's animation is off.")
+  expect(await frozen()).toEqual([true, true])
+  expect((await run($, 'motion on')).text).toBe("The band's animation is on.")
+  expect(await frozen()).toEqual([false, false])
+  await ui.unmount()
 })

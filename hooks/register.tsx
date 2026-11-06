@@ -1,26 +1,33 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Core, RateRow } from '../types'
+import type { ColdAsk, Core, RateRow } from '../types'
 import { BG, MODE_HUE, MUTED, PLAN_GLYPH, PLAN_HUE, TONE, mascotSvg, statusSvg, usageSvg } from './art'
-import type { Options } from './logic'
+import type { ColdChoice, Effort, Options, PlanState } from './logic'
 import {
+  CHOICE_HUE,
   DEFAULT_KEEP_MS,
+  EFFORTS,
   EMPTY,
   HOUR,
   MINUTE,
   cacheParts,
   cacheText,
+  coldCase,
+  coldChoices,
+  compactModels,
   decide,
   coldState,
   estimates,
   familyKey,
   builtinIdle,
   isHeadlessRefusal,
+  isEffort,
   isWarmOn,
+  lowerModels,
   needsWarning,
-  switchTargets,
   nextCost,
+  picksCompactModel,
   shortName,
   parseDuration,
   parseOptions,
@@ -31,10 +38,12 @@ import {
   span,
   tok,
   usd,
+  wantsAwake,
 } from './logic'
 
 const core = atom({ plugin: 'cache-keeper', key: 'core' } as const, EMPTY)
 const rate = atom({ plugin: 'cache-keeper', key: 'rate' } as const, [] as RateRow[])
+const ask = atom({ plugin: 'cache-keeper', key: 'ask' } as const, null as ColdAsk | null)
 
 const TICK_MS = 30_000
 const COMPACT_RETRY_MS = 2 * MINUTE
@@ -94,6 +103,8 @@ let cancelTick: (() => void) | null = null
 let viaCommand = false
 // A turn has finished in this process. In memory, so a host that re-runs session start cannot clear it.
 let armedHere = false
+// The effort the last main-thread request went out at, so a compaction on another effort can put it back.
+let lastEffort: string | undefined
 
 /**
  * Usage is the account's, not the session's, so every session shows the newest
@@ -221,6 +232,99 @@ async function runPing($: EngineInterface, now: number): Promise<void> {
   $.ui.log(`cache-keeper: keepwarm stopped: ${reply.reason}.`)
 }
 
+/** Keep awake and motion as `/cache-keeper` set them, kept across sessions; unset follows the plugin option. */
+type Prefs = { keepAwake?: boolean; animate?: boolean }
+
+const PREFS_KEY = 'prefs'
+// The plugin option as set, before a command overrides it.
+let baseKeepAwake = false
+// The drawings animate unless `/cache-keeper motion off` said otherwise.
+let animate = true
+
+/** Reads what any session saved, so every session follows the last command. */
+async function loadPrefs($: EngineInterface, options: Options): Promise<void> {
+  const saved = ((await $.store.get(PREFS_KEY).catch(() => undefined)) ?? {}) as Prefs
+
+  options.keepAwake = saved.keepAwake ?? baseKeepAwake
+  animate = saved.animate ?? true
+}
+
+async function setPref($: EngineInterface, options: Options, change: Prefs): Promise<void> {
+  const saved = ((await $.store.get(PREFS_KEY).catch(() => undefined)) ?? {}) as Prefs
+
+  await $.store.set(PREFS_KEY, { ...saved, ...change })
+  await loadPrefs($, options)
+  await reconcileAwake($, options)
+  $.ui.invalidate('ui.render')
+}
+
+// The helper process that holds the machine awake, while one runs.
+let awake: { stop: () => void } | null = null
+
+// Holds a system-required request for as long as it runs; killing it lets the machine sleep again.
+const WINDOWS_HOLD =
+  "$k = Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint f);' -Name P -Namespace CacheKeeper -PassThru; " +
+  '[void]$k::SetThreadExecutionState([uint32]2147483649); while ($true) { Start-Sleep -Seconds 60 }'
+
+async function holdCommands($: EngineInterface): Promise<string[][]> {
+  const os = await $.env.get('OS').catch(() => undefined)
+
+  if (os === 'Windows_NT') {
+    return [
+      ['pwsh', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_HOLD],
+      ['powershell', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_HOLD],
+    ]
+  }
+
+  return [['caffeinate', '-i'], ['systemd-inhibit', '--what=idle:sleep', '--who=cache-keeper', '--why=idle compaction', 'sleep', 'infinity']]
+}
+
+/** Starts the first helper that runs on this system; one that cannot start or ends by itself gives way to the next. */
+function holdAwake($: EngineInterface): { stop: () => void } {
+  let stopped = false
+  let child: { return?: (value?: never) => unknown } | null = null
+
+  void (async () => {
+    for (const argv of await holdCommands($)) {
+      if (stopped) return
+
+      try {
+        const stream = $.process.spawn({ argv })
+
+        child = stream as unknown as typeof child
+        for await (const _ of stream) if (stopped) break
+      } catch {
+        // Not on this system: try the next.
+      }
+
+      if (stopped) return
+    }
+
+    awake = null
+    $.ui.log('cache-keeper: keep awake found no helper to run on this system (pwsh, powershell, caffeinate or systemd-inhibit).')
+  })()
+
+  return {
+    stop: () => {
+      stopped = true
+      void Promise.resolve(child?.return?.()).catch(() => undefined)
+    },
+  }
+}
+
+/** Holds or lets go to match `wantsAwake`. */
+async function reconcileAwake($: EngineInterface, options: Options): Promise<void> {
+  const now = await $.clock.now()
+  const want = wantsAwake({ ...(await read($, core)), armed: armedHere }, now, options)
+
+  if (want && !awake) {
+    awake = holdAwake($)
+  } else if (!want && awake) {
+    awake.stop()
+    awake = null
+  }
+}
+
 async function tick($: EngineInterface, options: Options): Promise<void> {
   $.ui.invalidate('ui.render')
 
@@ -230,6 +334,8 @@ async function tick($: EngineInterface, options: Options): Promise<void> {
 
   try {
     await loadSavedRate($)
+    await loadPrefs($, options)
+    await reconcileAwake($, options)
 
     const now = await $.clock.now()
     const value = await read($, core)
@@ -268,16 +374,282 @@ async function keepText($: EngineInterface, text: string, why: string) {
   }
 }
 
+/** What a cold-send pick comes to: send as is, send on a lower model, or compact first and send on the model chosen. */
+type Plan =
+  | { road: 'send' }
+  | { road: 'switch'; model: string; effort?: Effort }
+  | { road: 'compact'; model: string; effort?: Effort; back: string }
+
+/** The words of each choice, with the price of the road where it has one. */
+function choiceLabel(choice: ColdChoice, held: ColdAsk, value: Core, now: number, options: Options): string {
+  const quote = (model: string) => {
+    const cost = nextCost(value, model, now, options)
+
+    return cost ? ` (${usd(cost.usd)})` : ''
+  }
+
+  if (choice === 'send') return `Continue on ${shortName(held.selected)}${quote(held.selected)}`
+  if (choice === 'switch') return 'Continue on a lower model'
+  if (choice === 'cancel') return 'Cancel'
+
+  const [only] = compactModels(held.kind, held.selected)
+
+  return picksCompactModel(held.kind) || !only ? 'Compact first' : `Compact on ${shortName(only)} first${quote(only)}`
+}
+
+/** The models the `model` step offers for the road picked. */
+const modelsFor = (held: ColdAsk) => (held.road === 'switch' ? lowerModels(held.selected) : compactModels(held.kind, held.selected))
+
+const setModel = ($: EngineInterface, model: string) => $.command.run({ command: 'model', args: model })
+
+/** Sets the effort with `/effort`; a failure is logged and the send goes on at the effort in force. */
+async function setEffort($: EngineInterface, effort: string): Promise<void> {
+  try {
+    await $.command.run({ command: 'effort', args: effort })
+  } catch (error) {
+    $.ui.log(`cache-keeper: could not set effort ${effort}: ${String(error)}`)
+  }
+}
+
+/** One compaction now: the direct call, or a /compact turn where the engine refuses it. */
+async function compactNow($: EngineInterface): Promise<{ skip?: string; tokensAfter?: number }> {
+  if (!viaCommand) {
+    try {
+      return await $.session.compact()
+    } catch (error) {
+      if (!isHeadlessRefusal(error)) throw error
+      viaCommand = true
+    }
+  }
+
+  await $.command.run({ command: 'compact', args: '' })
+  return {}
+}
+
+/**
+ * Carries out a cold-send pick, then sends the message as typed. The text is read back from the
+ * box, where the guard put it, so an edit made meanwhile is what goes; nothing is sent on a failure.
+ */
+async function perform($: EngineInterface, plan: Plan, held: string): Promise<void> {
+  const fail = async (why: string) => {
+    await update($, ask, () => null)
+    const restored = await $.prompt.fill({ text: held }).then(
+      filled => filled.isFilled,
+      () => false,
+    )
+    $.ui.log(`cache-keeper: ${why}, so nothing was sent.${restored ? ' Your text is in the box.' : ` Your text: ${held.slice(0, 3500)}`}`)
+  }
+
+  if (plan.road === 'switch') {
+    try {
+      await setModel($, plan.model)
+    } catch (error) {
+      return fail(`the switch to ${shortName(plan.model)} failed: ${String(error)}`)
+    }
+
+    if (plan.effort) await setEffort($, plan.effort)
+  }
+
+  if (plan.road === 'compact') {
+    const moves = familyKey(plan.model) !== familyKey(plan.back)
+    const effortBefore = lastEffort
+    const before = (await read($, core)).tokens
+
+    await update($, ask, held => (held ? { ...held, step: 'working' } : held))
+    isCompacting = true
+
+    try {
+      if (moves) await setModel($, plan.model)
+      if (plan.effort) await setEffort($, plan.effort)
+
+      const result = await compactNow($)
+
+      if (result.skip !== undefined) return fail(`the compaction was skipped: ${result.skip}`)
+
+      const after = result.tokensAfter ?? 0
+
+      await patch($, c => ({ ...c, compacted: true, compactTried: true, tokens: after > 0 ? after : c.tokens }))
+      $.ui.log(`cache-keeper: compacted ${tok(before)}${after > 0 ? ` to ${tok(after)}` : ''} on ${shortName(plan.model)} before sending.`)
+    } catch (error) {
+      return fail(`the compaction on ${shortName(plan.model)} failed: ${String(error)}`)
+    } finally {
+      isCompacting = false
+      // The message goes out on the model and effort it was typed for.
+      if (moves) await setModel($, plan.back).catch(error => $.ui.log(`cache-keeper: could not switch back to ${shortName(plan.back)}: ${String(error)}`))
+      if (plan.effort && effortBefore && effortBefore !== plan.effort) await setEffort($, effortBefore)
+    }
+  }
+
+  await update($, ask, () => null)
+
+  const typed = await $.prompt.read().then(
+    box => box.text,
+    () => '',
+  )
+  const text = typed.trim() !== '' ? typed : held
+
+  if (typed !== '') await $.prompt.fill({ text: '' }).catch(() => undefined)
+
+  // Not awaited: the call resolves only when its turn starts.
+  void $.prompt.submit({ text }).catch(error => $.ui.log(`cache-keeper: re-send failed: ${String(error)}`))
+}
+
+/** A band press on the cold-send dialog: the next step, or the plan once nothing is left to pick. */
+async function pressChoice($: EngineInterface, choice: ColdChoice | 'model' | 'effort', pick?: string): Promise<void> {
+  const held = await read($, ask)
+
+  if (!held || held.step === 'working') return
+
+  if (choice === 'cancel') {
+    await update($, ask, () => null)
+    return
+  }
+
+  if (choice === 'send') return perform($, { road: 'send' }, held.text)
+
+  if (choice === 'switch' || choice === 'compact') {
+    if (choice === 'compact' && !picksCompactModel(held.kind)) {
+      const [model] = compactModels(held.kind, held.selected)
+
+      return perform($, { road: 'compact', model: model ?? held.selected, back: held.selected }, held.text)
+    }
+
+    await update($, ask, () => ({ ...held, step: 'model', road: choice }))
+    return
+  }
+
+  if (choice === 'model' && pick) {
+    await update($, ask, () => ({ ...held, step: 'effort', model: pick }))
+    return
+  }
+
+  if (choice === 'effort' && pick && isEffort(pick) && held.model) {
+    const plan: Plan =
+      held.road === 'switch'
+        ? { road: 'switch', model: held.model, effort: pick }
+        : { road: 'compact', model: held.model, effort: pick, back: held.selected }
+
+    return perform($, plan, held.text)
+  }
+}
+
+/**
+ * The same dialog in the engine's own question box, which reaches every surface (Remote Control
+ * and SDK hosts too) but draws no colors. Null for a cancel; throws when it cannot be shown.
+ */
+async function askInSteps($: EngineInterface, held: ColdAsk, value: Core, now: number, options: Options): Promise<Plan | null> {
+  const choices = coldChoices(held.kind, held.selected)
+  const labels = choices.map(choice => choiceLabel(choice, held, value, now, options))
+  const answer = await $.ui.ask(
+    `The ${shortName(held.selected)} prompt cache ${held.coldFor}. This message re-writes ${tok(held.tokens)} tokens. How should it go?`,
+    { header: 'Cold cache', options: labels },
+  )
+  const choice = choices[labels.indexOf(answer)]
+
+  if (!choice || choice === 'cancel') return null
+  if (choice === 'send') return { road: 'send' }
+
+  if (choice === 'compact' && !picksCompactModel(held.kind)) {
+    const [model] = compactModels(held.kind, held.selected)
+
+    return { road: 'compact', model: model ?? held.selected, back: held.selected }
+  }
+
+  const models = modelsFor({ ...held, road: choice })
+  const modelLabels = models.map(model => {
+    const cost = nextCost(value, model, now, options)
+
+    return `${shortName(model)}${cost ? ` (${usd(cost.usd)})` : ''}`
+  })
+  const pickedModel = models[modelLabels.indexOf(await $.ui.ask(choice === 'switch' ? 'Continue on which model?' : 'Compact on which model?', { header: 'Model', options: modelLabels }))]
+
+  if (!pickedModel) return null
+
+  // The box takes four options; max is typed under Other.
+  const effort = (await $.ui.ask('At which effort? Type max under Other for max.', { header: 'Effort', options: ['low', 'medium', 'high', 'xhigh'] })).trim().toLowerCase()
+
+  if (!isEffort(effort)) return null
+
+  return choice === 'switch'
+    ? { road: 'switch', model: pickedModel, effort }
+    : { road: 'compact', model: pickedModel, effort, back: held.selected }
+}
+
+/** The cold-send dialog as band rows: a line of what it costs, then one colored button per choice. */
+function coldDialog($: EngineInterface, ui: ReturnType<EngineInterface['ui']['resolve']>, held: ColdAsk, value: Core, now: number, options: Options) {
+  const { Box, Button, Text } = ui
+  const label = shortName(held.selected)
+  type Row = { key: string; label: string; hue: string | undefined; press: () => Promise<void> }
+  let question: string
+  let rows: Row[]
+
+  if (held.step === 'working') {
+    question = `Compacting on ${shortName(held.model ?? compactModels(held.kind, held.selected)[0] ?? held.selected)}, then sending on ${label}...`
+    rows = []
+  } else if (held.step === 'model') {
+    question = held.road === 'switch' ? 'Continue on which model?' : 'Compact on which model?'
+    rows = modelsFor(held).map(model => {
+      const cost = nextCost(value, model, now, options)
+
+      return {
+        key: `cold-model-${familyKey(model)}`,
+        label: `${shortName(model)}${cost ? ` (${usd(cost.usd)})` : ''}`,
+        hue: CHOICE_HUE.compact,
+        press: () => pressChoice($, 'model', model),
+      }
+    })
+  } else if (held.step === 'effort') {
+    question = `${held.road === 'switch' ? 'Continue' : 'Compact'} on ${shortName(held.model ?? '')} at which effort?`
+    rows = EFFORTS.map(effort => ({ key: `cold-effort-${effort}`, label: effort, hue: CHOICE_HUE.compact, press: () => pressChoice($, 'effort', effort) }))
+  } else {
+    question = `The ${label} cache ${held.coldFor}. This message re-writes ${tok(held.tokens)} tokens.`
+    rows = coldChoices(held.kind, held.selected).map(choice => ({
+      key: `cold-${choice}`,
+      label: choiceLabel(choice, held, value, now, options),
+      hue: CHOICE_HUE[choice],
+      press: () => pressChoice($, choice),
+    }))
+  }
+
+  if (held.step !== 'choose' && held.step !== 'working') {
+    rows.push({ key: 'cold-cancel', label: 'Cancel', hue: CHOICE_HUE.cancel, press: () => pressChoice($, 'cancel') })
+  }
+
+  const onPress = (press: () => Promise<void>) => () => {
+    void press().catch(error => $.ui.log(`cache-keeper: ${String(error)}`))
+  }
+
+  return (
+    <Box key="cold" flexDirection="column" marginBottom={1}>
+      <Text color="warning" bold>
+        {question}
+      </Text>
+      <Box flexDirection="row" flexWrap="wrap">
+        {rows.map((row, at) => (
+          <Box key={`${row.key}-box`} marginRight={2}>
+            <Button key={row.key} label={row.label} hotkey={String(at + 1)} onPress={onPress(row.press)}>
+              {row.hue ? <Text color={row.hue}>{row.label}</Text> : row.label}
+            </Button>
+          </Box>
+        ))}
+      </Box>
+    </Box>
+  )
+}
+
 export const register: Register = (on, rawOptions) => {
   const options = parseOptions(rawOptions as Readonly<Record<string, unknown>>)
+
+  baseKeepAwake = options.keepAwake
 
   on('session.start', async ($, e, next) => {
     viaCommand = !e.isInteractive
     options.builtin = await readBuiltin($)
+    await loadPrefs($, options)
     await $.command.register({
       name: 'cache-keeper',
-      description: 'Shows the prompt cache state; "compact on" or "compact off" sets auto compact for this session.',
-      argumentHint: '[compact on|off]',
+      description: 'Shows the prompt cache state; "compact", "awake" or "motion" with on or off sets idle compaction for this session, keep awake, or the band animation.',
+      argumentHint: '[compact|awake|motion on|off]',
     })
     await $.command.register({
       name: 'keepwarm',
@@ -305,6 +677,8 @@ export const register: Register = (on, rawOptions) => {
   on('session.end', ($, e, next) => {
     cancelTick?.()
     cancelTick = null
+    awake?.stop()
+    awake = null
 
     return next(e)
   })
@@ -351,8 +725,9 @@ export const register: Register = (on, rawOptions) => {
   on('turn.start', async ($, e, next) => {
     if (!e.agentId && !isCompacting) {
       isTurnRunning = true
-      // A real turn adds context, so a later idle may compact again.
+      // A real turn adds context, so a later idle may compact again; a dialog it went past is moot.
       await patch($, c => ({ ...c, compacted: false, compactTried: false }))
+      if (await read($, ask)) await update($, ask, () => null)
     }
 
     return next(e)
@@ -363,6 +738,7 @@ export const register: Register = (on, rawOptions) => {
       // The cache TTL runs from the start of the request.
       const now = await $.clock.now()
 
+      if (typeof e.effort === 'string') lastEffort = e.effort
       await patch($, c => ({ ...c, lastAt: now, replyModel: e.model, byModel: { ...c.byModel, [familyKey(e.model)]: now } }))
     }
 
@@ -389,6 +765,8 @@ export const register: Register = (on, rawOptions) => {
           : c.byModel,
       }))
       await measure($)
+      // Claude Code lets go of its own hold shortly after a turn; this one takes over at once.
+      await reconcileAwake($, options)
     }
 
     return next(e)
@@ -420,55 +798,64 @@ export const register: Register = (on, rawOptions) => {
     const price = nextCost(value, selected, now, options)
     const cost = price ? usd(price.usd) : null
     const coldFor = coldState(value, selected, now, options)
+    const notice = `cache-keeper: the ${label} cache ${coldFor}; this message re-writes ${tok(value.tokens)} tokens${cost ? `, about ${cost}` : ''}.`
 
     if (options.guard === 'warn') {
-      $.ui.log(`cache-keeper: the ${label} cache ${coldFor}; this message re-writes ${tok(value.tokens)} tokens${cost ? `, about ${cost}` : ''}.`)
+      $.ui.log(notice)
       return next(e)
     }
 
-    // A message with attachments stays on its model: they do not survive a re-send.
-    const switches = e.attachments?.length
-      ? []
-      : switchTargets(selected).map(model => {
-          const quote = nextCost(value, model, now, options)
+    const held: ColdAsk = {
+      text: e.text,
+      kind: coldCase(value.replyModel || value.model || selected, selected),
+      selected,
+      coldFor,
+      tokens: value.tokens,
+      step: 'choose',
+    }
+    const waiting = await read($, ask)
 
-          return { model, text: `Switch to ${shortName(model)}${quote ? ` (${usd(quote.usd)})` : ''}` }
-        })
-    const send = `Send on ${label}${cost ? ` (${cost})` : ''}`
-    let answer: string
+    // At the composer the band asks, in color. The same text sent again while it asks means the
+    // band is not in view, so the engine's question box asks instead.
+    if (e.origin.kind === 'composer' && !e.attachments?.length && waiting?.text !== e.text) {
+      await update($, ask, () => held)
+      return keepText($, e.text, `the ${label} cache ${coldFor}; pick how to send it above the prompt`)
+    }
+
+    await update($, ask, () => null)
+
+    let plan: Plan | null
 
     try {
-      answer = await $.ui.ask(
-        `The ${label} prompt cache ${coldFor}. This message re-writes ${tok(value.tokens)} tokens. Send it on ${label}, or switch model first?`,
-        { header: 'Cold cache', options: [send, ...switches.map(option => option.text), "Don't send"] },
-      )
+      // A message with attachments is sent or kept: they do not survive a re-send.
+      plan = e.attachments?.length
+        ? (await $.ui.ask(`The ${label} prompt cache ${coldFor}. This message re-writes ${tok(value.tokens)} tokens. Send it?`, {
+            header: 'Cold cache',
+            options: [`Continue on ${label}${cost ? ` (${cost})` : ''}`, 'Cancel'],
+          })) === 'Cancel'
+          ? null
+          : { road: 'send' }
+        : await askInSteps($, held, value, now, options)
     } catch {
       // A dialog that could not be shown must never eat a prompt.
-      $.ui.log(`cache-keeper: the ${label} cache ${coldFor}; this message re-writes ${tok(value.tokens)} tokens.`)
+      $.ui.log(notice)
       return next(e)
     }
 
-    if (answer === send) return next(e)
+    if (!plan) return keepText($, e.text, 'not sent')
+    if (plan.road === 'send') return next(e)
 
-    const picked = switches.find(option => option.text === answer)
+    // Run from a timer, once this prompt has ended: the engine refuses a command run from this hook,
+    // as it would wait on the turn the hook holds.
+    const queued = plan
 
-    if (picked) {
-      const target = shortName(picked.model)
+    $.clock.after(0, () => {
+      void perform($, queued, e.text).catch(error => $.ui.log(`cache-keeper: ${String(error)}`))
+    })
 
-      try {
-        await $.command.run({ command: 'model', args: picked.model })
-      } catch (error) {
-        $.ui.log(`cache-keeper: could not switch to ${target}: ${String(error)}`)
-        return keepText($, e.text, `the switch to ${target} failed, so nothing was sent`)
-      }
-
-      // Re-sent on the new model. Not awaited: the call resolves only when its turn starts, which waits for this prompt to end.
-      void $.prompt.submit({ text: e.text }).catch(error => $.ui.log(`cache-keeper: re-send failed: ${String(error)}`))
-
-      return { drop: `cache-keeper: sent on ${target} instead.` }
+    return {
+      drop: `cache-keeper: ${plan.road === 'switch' ? `switching to ${shortName(plan.model)}` : `compacting on ${shortName(plan.model)} first`}, then sending your message.`,
     }
-
-    return keepText($, e.text, 'not sent')
   })
 
   on('command.run', { command: 'cache-keeper' }, async ($, e) => {
@@ -476,10 +863,21 @@ export const register: Register = (on, rawOptions) => {
 
     if (arg === 'compact on' || arg === 'compact off') {
       await patch($, c => ({ ...c, noCompact: arg === 'compact off' }))
-      return { text: `Auto compact is ${arg === 'compact off' ? 'off' : 'on'} for this session.` }
+      return { text: `cache-keeper's idle compaction is ${arg === 'compact off' ? 'off' : 'on'} for this session.` }
     }
 
-    if (arg !== '') return { text: 'Usage: /cache-keeper [compact on|off]' }
+    // Kept for every session, as the band shows them.
+    if (arg === 'awake on' || arg === 'awake off') {
+      await setPref($, options, { keepAwake: arg === 'awake on' })
+      return { text: arg === 'awake on' ? 'Keep awake is on: idle sleep is held off while an idle compaction waits on a warm cache.' : 'Keep awake is off.' }
+    }
+
+    if (arg === 'motion on' || arg === 'motion off') {
+      await setPref($, options, { animate: arg === 'motion on' })
+      return { text: `The band's animation is ${arg === 'motion on' ? 'on' : 'off'}.` }
+    }
+
+    if (arg !== '') return { text: 'Usage: /cache-keeper [compact|awake|motion on|off]' }
 
     const now = await $.clock.now()
     const value = await read($, core)
@@ -502,7 +900,7 @@ export const register: Register = (on, rawOptions) => {
         cache,
         `Next message by model: ${table}.`,
         ...(rows.length ? [`usage left: ${rows.join(', ')}`] : []),
-        `idle compaction: ${autoCompact}; floor ${tok(options.minTokens)}; guard: ${options.guard}; cache TTL: ${span(options.ttlMs)}`,
+        `idle compaction: ${autoCompact}; floor ${tok(options.minTokens)}; guard: ${options.guard}; keep awake: ${options.keepAwake ? (awake ? 'holding' : 'on') : 'off'}; motion: ${animate ? 'on' : 'off'}; cache TTL: ${span(options.ttlMs)}`,
         'Dollar figures are API list-price estimates, not subscription charges.',
       ].join('\n'),
     }
@@ -540,8 +938,9 @@ export const register: Register = (on, rawOptions) => {
     const rows = await read($, rate)
     const selected = resolveModel(await $.session.model(), value)
     const cache = cacheParts({ ...value, armed: armedHere }, now, options, selected)
+    const held = await read($, ask)
 
-    if (!cache && rows.length === 0) return next(e)
+    if (!cache && rows.length === 0 && !held) return next(e)
 
     const parts = rateParts(rows, now)
     const columns = e.props.bodyColumns ?? e.viewport?.columns ?? 100
@@ -549,10 +948,13 @@ export const register: Register = (on, rawOptions) => {
     const { Box, Text } = ui
     // The terminal's table lists Svg too, so ask the surface.
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : null
+    const dialog = held ? coldDialog($, ui, held, value, now, options) : null
+    const awakeText = `keep awake ${options.keepAwake ? 'on' : 'off'}`
 
     if (!Svg) {
       return (
         <Box flexDirection="column">
+          {dialog}
           {parts.length > 0 ? (
             <Box flexDirection="row" flexWrap="wrap">
               {parts.map(part => (
@@ -577,6 +979,7 @@ export const register: Register = (on, rawOptions) => {
                   {PLAN_GLYPH[cache.planState]} {cache.plan}
                 </Text>
               ) : null}
+              <Text color={PLAN_HUE[options.keepAwake ? 'on' : 'off']}> · {PLAN_GLYPH[options.keepAwake ? 'on' : 'off']} {awakeText}</Text>
             </Box>
           ) : null}
         </Box>
@@ -584,20 +987,21 @@ export const register: Register = (on, rawOptions) => {
     }
 
     // Each drawing's source changes only when its words do, so nothing restarts on a redraw.
-    const usage = parts.length > 0 ? usageSvg(parts, columns >= 70 ? 10 : 5) : null
-    const figure = cache ? mascotSvg(cache.mode) : null
-    const status = cache ? statusSvg(cache) : null
+    const still = !animate
+    const usage = parts.length > 0 ? usageSvg(parts, columns >= 70 ? 10 : 5, still) : null
+    const figure = cache ? mascotSvg(cache.mode, still) : null
+    const status = cache ? statusSvg(cache, still, { text: awakeText, isOn: options.keepAwake }) : null
     const usageAlt = parts.map(part => `${part.name} ${part.left}% left`).join(', ')
 
-    return (
-      <Box flexDirection="row" flexWrap="wrap" alignItems="center" backgroundColor={BG} paddingX={1}>
+    const band = (
+      <Box key="band" flexDirection="row" flexWrap="wrap" alignItems="center" backgroundColor={BG} borderStyle="round" borderColor={BG} paddingX={1}>
         {usage ? (
           <Box key="usage" flexShrink={0} marginRight={2}>
             <Svg source={usage.source} alt={usageAlt} width={usage.width} height={usage.height} />
           </Box>
         ) : null}
         {figure && status && cache ? (
-          <Box key="cache" flexDirection="row" alignItems="center" flexShrink={0}>
+          <Box key="cache" flexDirection="row" flexWrap="wrap" alignItems="center">
             <Box key="figure" flexShrink={0} marginRight={1}>
               <Svg source={figure.source} alt={cache.summary} width={figure.width} height={figure.height} isInteractive />
             </Box>
@@ -607,6 +1011,15 @@ export const register: Register = (on, rawOptions) => {
           </Box>
         ) : null}
       </Box>
+    )
+
+    return dialog ? (
+      <Box flexDirection="column">
+        {dialog}
+        {band}
+      </Box>
+    ) : (
+      band
     )
   })
 }

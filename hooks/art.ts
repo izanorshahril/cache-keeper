@@ -33,6 +33,8 @@ const widthOf = (text: string, size: number, spacing = 0) =>
 const esc = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
 const STILL = '@media (prefers-reduced-motion:reduce){*{animation:none!important}}'
+// The band's motion switch off: every drawing holds its first frame.
+const FROZEN = 'svg *{animation:none!important}'
 
 const doc = (width: number, height: number, css: string, body: string, hasFont: boolean) =>
   `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><style>` +
@@ -94,7 +96,7 @@ function usageDots(part: RatePart, cells: number, x: number, index: number): str
 }
 
 /** USAGE, then each window's dots, percent left and reset time, coloured by how much is left. */
-export function usageSvg(parts: readonly RatePart[], cells: number): Drawing {
+export function usageSvg(parts: readonly RatePart[], cells: number, still = false): Drawing {
   let x = 0
   let body = runs([{ text: 'USAGE', size: 12.5, weight: 700, fill: TEXT, spacing: 0.6 }], x, BASE).svg
 
@@ -128,7 +130,8 @@ export function usageSvg(parts: readonly RatePart[], cells: number): Drawing {
   const width = Math.ceil(x - 12)
   const css =
     '.dot{animation:breathe 3.2s ease-in-out infinite}@keyframes breathe{0%,70%,100%{filter:none}35%{filter:brightness(1.35)}}' +
-    '.alert{animation:alert 1.3s ease-in-out infinite}@keyframes alert{50%{opacity:.5}}'
+    '.alert{animation:alert 1.3s ease-in-out infinite}@keyframes alert{50%{opacity:.5}}' +
+    (still ? FROZEN : '')
   const defs = '<defs><filter id="glow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="1.1" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>'
 
   return { source: doc(width, USAGE_HEIGHT, css, defs + body, true), width, height: USAGE_HEIGHT }
@@ -171,7 +174,7 @@ function planIcon(state: PlanState, x: number, cy: number): string {
 }
 
 /** The chip, with a light sweeping across it, then the time, cost and plan. */
-export function statusSvg(cache: CacheParts): Drawing {
+export function statusSvg(cache: CacheParts, still = false, awake?: { text: string; isOn: boolean }): Drawing {
   const hue = MODE_HUE[cache.mode]
   const word = WORD[cache.mode]
   const chipWidth = Math.ceil(widthOf(word, 12, 1) + 18)
@@ -201,13 +204,25 @@ export function statusSvg(cache: CacheParts): Drawing {
     end = words.end
   }
 
+  if (awake) {
+    // The same icons as idle compaction: a green tick on, a grey struck-out ring off.
+    const state: PlanState = awake.isOn ? 'on' : 'off'
+    const dot = runs([{ text: '·', size: 12.5, weight: 500, fill: MUTED, gap: 5 }], end, y)
+    const iconX = dot.end + 5
+    const words = runs([{ text: awake.text, size: 12.5, weight: 600, fill: awake.isOn ? TEXT : MUTED, opacity: awake.isOn ? 0.88 : 1 }], iconX + PLAN_ICON + 4, y)
+
+    plan += dot.svg + `<g role="img" aria-label="${state}">${planIcon(state, iconX, y - 4.4)}</g>` + words.svg
+    end = words.end
+  }
+
   const text = { svg: lead.svg + plan, end }
   const width = Math.ceil(text.end + 2)
   const height = 34
   const css =
     '.chip{animation:halo 2.8s ease-in-out infinite}@keyframes halo{50%{filter:drop-shadow(0 0 3.5px ' + hue + ')}}' +
     '.sweep{animation:sweep 4.5s ease-in-out infinite}@keyframes sweep{0%,55%{transform:translateX(-30px)}100%{transform:translateX(' + (chipWidth + 30) + 'px)}}' +
-    '.hand{animation:hand 6s linear infinite}@keyframes hand{to{transform:rotate(360deg)}}'
+    '.hand{animation:hand 6s linear infinite}@keyframes hand{to{transform:rotate(360deg)}}' +
+    (still ? FROZEN : '')
   const body =
     `<defs><clipPath id="c"><rect x="${left}" y="${top}" width="${chipWidth}" height="${chipHeight}" rx="6.5"/></clipPath></defs>` +
     `<g class="chip"><rect x="${left}" y="${top}" width="${chipWidth}" height="${chipHeight}" rx="6.5" fill="${hue}"/></g>` +
@@ -319,7 +334,7 @@ const SLEEP_CSS =
 const SIZE = { width: 46, height: 36 }
 
 /** The mascot: bobbing with embers when warm, iced over when cold, napping once compacted. */
-export function mascotSvg(mode: CacheParts['mode']): Drawing {
+export function mascotSvg(mode: CacheParts['mode'], still = false): Drawing {
   const shadow = '<ellipse class="shadow" cx="12" cy="16.6" rx="8.5" ry=".8" fill="#000" opacity=".4"/>'
   const open = '<g transform="translate(1 2.5)" shape-rendering="crispEdges">'
   let css = FIGURE_CSS
@@ -352,6 +367,8 @@ export function mascotSvg(mode: CacheParts['mode']): Drawing {
       '<text class="z z2" x="21" y="5" font-size="3.6">z</text>' +
       '<text class="z z3" x="22" y="4" font-size="4.2">Z</text></g>'
   }
+
+  if (still) css += FROZEN
 
   const source = doc(SIZE.width, SIZE.height, css, `<g transform="scale(1.72 1.72) translate(.2 .2)">${body}</g>`, false)
 

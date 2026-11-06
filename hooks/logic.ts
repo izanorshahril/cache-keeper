@@ -22,6 +22,8 @@ export const EMPTY: Core = {
 
 export type Options = {
   autoCompact: boolean
+  /** Hold the machine awake while an idle compaction or keepwarm still waits on a warm cache. */
+  keepAwake: boolean
   guard: 'ask' | 'warn' | 'off'
   ttlMs: number
   minTokens: number
@@ -43,6 +45,7 @@ export function parseOptions(raw: Readonly<Record<string, unknown>>): Options {
   return {
     // The fallback is off unless asked for: compaction replaces detail with a summary.
     autoCompact: raw.autoCompact === 'on',
+    keepAwake: raw.keepAwake === 'on',
     guard: raw.guard === 'warn' || raw.guard === 'off' ? raw.guard : 'ask',
     ttlMs,
     // A compaction must start while the cache still serves it, so a longer setting is held a minute short of cold.
@@ -86,6 +89,21 @@ export function decide({ now, core, options, isTurnRunning, nextPingAt, nextComp
     options.autoCompact && core.armed && !core.noCompact && !core.compactTried && core.tokens >= options.minTokens
 
   return canCompact && now >= nextCompactAt && idle >= options.compactAt ? 'compact' : 'none'
+}
+
+/**
+ * Whether to hold the machine awake now: keep awake is on, and an idle compaction (the fallback's
+ * or Claude Code's) or keepwarm still waits on a warm cache. A compaction done, or a cache gone
+ * cold, lets the machine sleep again: nothing is left that waking could save.
+ */
+export function wantsAwake(core: Core, now: number, options: Options): boolean {
+  if (!options.keepAwake || core.lastAt === 0 || core.compacted || now - core.lastAt >= options.ttlMs) return false
+  if (core.keepUntil > now) return true
+
+  const fallback = options.autoCompact && core.armed && !core.noCompact && !core.compactTried && core.tokens >= options.minTokens
+  const builtin = options.builtin !== null && options.ttlMs === HOUR && core.tokens >= options.builtin.minTokens
+
+  return fallback || builtin
 }
 
 /** True when a ping read the cache rather than paying to write it again. */
@@ -262,17 +280,72 @@ export const isWarmOn = (core: Core, model: string, now: number, options: Option
   return !core.compacted && last > 0 && now - last < options.ttlMs
 }
 
-/** A message needs the cold-cache warning only off Haiku, with its model's cache cold and a large context. */
+/** A message needs the cold-cache warning on any model, Haiku too, with its model's cache cold and a large context. */
 export function needsWarning(core: Core, model: string, now: number, options: Options): boolean {
-  return shortName(model) !== 'Haiku' && !isWarmOn(core, model, now, options) && core.tokens >= options.minTokens
+  return !isWarmOn(core, model, now, options) && core.tokens >= options.minTokens
 }
 
-const SWITCH_TARGETS = ['claude-haiku-5-5', 'claude-sonnet-5-5']
+/** Model families from the cheapest up; a model not listed ranks with the large ones. */
+const TIERS = ['Haiku', 'Sonnet', 'Opus', 'Fable']
+const rankOf = (model: string) => {
+  const at = TIERS.indexOf(shortName(model))
 
-/** The models the warning offers as a switch: every target but the model in use. */
-export function switchTargets(model: string): string[] {
-  return SWITCH_TARGETS.filter(target => familyKey(target) !== familyKey(model))
+  return at === -1 ? TIERS.length : at
 }
+const isHaiku = (model: string) => shortName(model) === 'Haiku'
+
+/** Which of the four cold-send dialogs applies: the last reply's model, then the model about to send. */
+export type ColdCase = 'large-large' | 'large-haiku' | 'haiku-large' | 'haiku-haiku'
+
+export function coldCase(lastModel: string, selected: string): ColdCase {
+  const from = lastModel && isHaiku(lastModel) ? 'haiku' : 'large'
+
+  return `${from}-${isHaiku(selected) ? 'haiku' : 'large'}` as ColdCase
+}
+
+/**
+ * What the cold-send dialog offers. `send` re-writes the whole cache at full price (red); `switch`
+ * and `compact` cost less (yellow); `cancel` keeps the text.
+ */
+export type ColdChoice = 'send' | 'switch' | 'compact' | 'cancel'
+
+export function coldChoices(kind: ColdCase, selected: string): ColdChoice[] {
+  if (kind === 'haiku-haiku') return ['send', 'cancel']
+  if (kind === 'large-large' && lowerModels(selected).length > 0) return ['send', 'switch', 'compact', 'cancel']
+
+  return ['send', 'compact', 'cancel']
+}
+
+/** The theme color of each choice: red for the full re-write, yellow for the cheaper roads, none for cancel. */
+export const CHOICE_HUE: Readonly<Record<ColdChoice, 'error' | 'warning' | undefined>> = {
+  send: 'error',
+  switch: 'warning',
+  compact: 'warning',
+  cancel: undefined,
+}
+
+/** The models below this one, the next one down first: what "continue on a lower model" offers. */
+export function lowerModels(selected: string): string[] {
+  return ESTIMATE_MODELS.filter(model => rankOf(model) < rankOf(selected))
+}
+
+/**
+ * The models a compaction may run on before the send. A large model that stays large picks any
+ * model; every other case compacts on Haiku, the one it named.
+ */
+export function compactModels(kind: ColdCase, selected: string): string[] {
+  if (kind === 'large-large') return [...ESTIMATE_MODELS].reverse()
+  if (kind === 'large-haiku') return [isHaiku(selected) ? selected : 'claude-haiku-5-5']
+
+  return ['claude-haiku-5-5']
+}
+
+/** Whether the compaction's model and effort are picked, or fixed by the case. */
+export const picksCompactModel = (kind: ColdCase) => kind === 'large-large'
+
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type Effort = (typeof EFFORTS)[number]
+export const isEffort = (value: string): value is Effort => (EFFORTS as readonly string[]).includes(value)
 
 export type NextCost = { label: string; usd: number; warm: boolean }
 
@@ -322,7 +395,7 @@ export function compactStatus(core: Core, now: number, options: Options, isWarm:
   if (options.autoCompact && !core.noCompact) {
     const willFire = isWarm && core.armed && !core.compactTried && core.tokens >= options.minTokens
 
-    return willFire ? `auto compact in ${span(Math.max(0, options.compactAt - sinceAny))}` : 'auto compact on'
+    return willFire ? `idle compact in ${span(Math.max(0, options.compactAt - sinceAny))}` : 'idle compact on'
   }
 
   const builtin = options.builtin

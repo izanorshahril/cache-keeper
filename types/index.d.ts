@@ -26,8 +26,26 @@ export type Core = {
 
 export type RateRow = { kind: string; percentUsed: number; resetsAt?: string }
 
+/** The cold-send dialog the band shows while a held message waits for a pick; null when none waits. */
+export type ColdAsk = {
+  /** The message held back, also put back in the prompt box. */
+  text: string
+  /** The last reply's model, then the model about to send: `large-large`, `large-haiku`, `haiku-large`, `haiku-haiku`. */
+  kind: 'large-large' | 'large-haiku' | 'haiku-large' | 'haiku-haiku'
+  /** The model the message would be sent on. */
+  selected: string
+  /** How the cache went cold, as the band words it. */
+  coldFor: string
+  tokens: number
+  step: 'choose' | 'model' | 'effort' | 'working'
+  /** The road picked at `choose`, once one needing a model or effort is. */
+  road?: 'switch' | 'compact'
+  /** The model picked at `model`. */
+  model?: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'cache-keeper': { core: Core; rate: RateRow[] }
+    'cache-keeper': { core: Core; rate: RateRow[]; ask: ColdAsk | null }
   }
 }

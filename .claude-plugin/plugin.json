@@ -1,21 +1,28 @@
 {
   "name": "cache-keeper",
   "version": "0.1.0",
-  "description": "Band with usage left, prompt-cache state and idle compaction status, a cold-send guard, optional keepwarm, and an optional auto compact before an idle session's cache goes cold.",
+  "description": "Band with usage left, prompt-cache state and idle compaction status, a cold-send guard, optional keepwarm, and an optional idle compact fallback before an idle session's cache goes cold.",
   "author": { "name": "izanorshahril" },
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
     "autoCompact": {
       "type": "string",
-      "title": "Auto compact fallback",
+      "title": "Idle compact fallback",
       "description": "cache-keeper's own idle compaction, off by default: compact once when the session idles, before the cache goes cold. For sessions where Claude Code's idle compaction does not run.",
+      "options": ["off", "on"],
+      "default": "off"
+    },
+    "keepAwake": {
+      "type": "string",
+      "title": "Keep awake",
+      "description": "Hold the machine out of idle sleep while an idle compaction or keepwarm still waits on a warm cache, then let it sleep. `/cache-keeper awake on|off` overrides this.",
       "options": ["off", "on"],
       "default": "off"
     },
     "compactAfter": {
       "type": "string",
-      "title": "Auto compact after idle",
+      "title": "Idle compact fallback after",
       "description": "Idle time before the fallback compacts: auto is 55m on a 1h cache (5m before cold) and 4m on a 5m cache.",
       "options": ["auto", "55m", "45m", "30m", "15m", "5m"],
       "default": "auto"
@@ -37,7 +44,7 @@
     "minTokens": {
       "type": "string",
       "title": "Large-context floor",
-      "description": "Context size, in tokens, below which neither auto compact nor the guard acts.",
+      "description": "Context size, in tokens, below which neither idle compaction nor the guard acts.",
       "options": ["20000", "50000", "100000", "200000"],
       "default": "50000"
     }

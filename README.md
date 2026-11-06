@@ -1,17 +1,18 @@
 # cache-keeper
 
 A Claude Code mod that makes an idle session cheap to come back to.
-It combines the ideas of [ribbon](https://github.com/robonuggets/ribbon) and [cache-tax](https://github.com/karanb192/cache-tax) (both MIT) with an idle compaction status and an optional auto compact of its own.
+It combines the ideas of [ribbon](https://github.com/robonuggets/ribbon) and [cache-tax](https://github.com/karanb192/cache-tax) (both MIT) with an idle compaction status and an optional idle compact fallback of its own.
 The code and mascot art are written here; none is copied from either project.
 
 ![The band counting down, compacting, then going cold](media/cache-keeper.gif)
 
 | Part | From | What it does |
 | --- | --- | --- |
-| Band above the prompt | ribbon | 7D and 5H usage left with reset times, then the mascot, cache state, next-message cost and idle compaction status. |
-| Cold-send guard | cache-tax | On Opus or Sonnet, before a message that would re-write a large cold cache, asks with the estimated cost and offers a cheaper model. "Don't send" puts your text back in the box. |
+| Band above the prompt | ribbon | 7D and 5H usage left with reset times, then the mascot, cache state, next-message cost, idle compaction status and keep awake status. |
+| Cold-send guard | cache-tax | On any model, before a message that would re-write a large cold cache, asks in the band with the estimated cost: continue, a lower model, compact first, or cancel, colored by cost. |
 | `/keepwarm` | cache-tax | Billed pings keep the cache alive for a window you choose. Manual only here. |
-| Auto compact fallback | new | Off by default. Compacts once when the session idles, just before the cache goes cold. |
+| Idle compact fallback | new | Compacts once when the session idles, just before the cache goes cold, where Claude Code's own idle compaction does not run. Off by default. |
+| Keep awake | new | Off by default. Holds the machine out of idle sleep while an idle compaction still waits on a warm cache, then lets it sleep. `/cache-keeper awake on` turns it on. |
 
 ## Install
 
@@ -67,9 +68,30 @@ After a restart or resume, the time since the last reply is put on the model tha
 
 `/cache-keeper` lists the next message's price on Fable, Opus, Sonnet and Haiku, each marked read or write.
 
-The guard skips Haiku, whose cold write is cheap.
-On Opus or Sonnet with a cold cache, it asks before sending and offers to switch to Haiku or Sonnet, each with its price; picking one switches the model and sends the message there.
-A message with attachments is offered no switch, since they do not survive the re-send.
+## Cold-send guard
+
+On any model, Haiku included, a message that would re-write a large cold cache is held back and put back in the prompt box.
+The band then asks how to send it, with the estimated cost on each road.
+What it offers depends on the model of the last reply and the model about to send:
+
+| Last reply | Sending on | Choices |
+| --- | --- | --- |
+| Fable, Opus or Sonnet | Fable, Opus or Sonnet | Continue on this model, continue on a lower model, compact first, cancel |
+| Fable, Opus or Sonnet | Haiku | Continue, compact on Haiku first, cancel |
+| Haiku | Fable, Opus or Sonnet | Continue, compact on Haiku first, cancel |
+| Haiku | Haiku | Continue, cancel |
+
+Continuing on a lower model picks any model below the selected one, then an effort from `low` to `max`.
+Compacting first from a large model to a large one picks any model and effort for the compaction.
+After the compaction the model and effort are set back, and the message goes out on the model it was typed for.
+
+The choices are colored by what they cost: continuing as is re-writes the whole cache at full price and is red, a lower model or a compaction costs less and is yellow, and cancel is plain.
+The message is sent as it reads in the box at the time of the pick, so an edit made meanwhile is what goes; cancel leaves it there.
+
+The band dialog is for messages typed at the composer.
+A message from Remote Control or an SDK host asks the same questions in Claude Code's question box, which reaches every surface but draws no colors and takes four options, so `max` effort is typed under Other.
+Sending the same text again while the band asks also opens the question box, in case the band is out of view.
+A message with attachments is offered only continue or cancel, since attachments do not survive a re-send.
 
 ## Idle compaction
 
@@ -79,21 +101,23 @@ It is a staged rollout: no setting turns it on, and Claude Code turns it on for 
 Where it is on, `/config` lists an `Idle compaction` row, and `"idleCompaction": false` in `settings.json` turns it off.
 In Claude Code 2.1.317 it acts at 90% of a 1h cache's life (54 minutes idle), on a context of 200k tokens or more, and only while auto-compact is on.
 
-The band always names idle compaction, with an icon whose shape and colour both say the state, so it reads at a glance without relying on colour:
+"Idle compact" in the band means either one: Claude Code's own where the account has it, cache-keeper's fallback otherwise.
+It is not Claude Code's auto-compact, which compacts when the context window fills.
+The band shows its state with an icon whose shape and colour both say it, so it reads without relying on colour:
 
 | Icon | Band | Means |
 | --- | --- | --- |
-| Amber clock | `idle compact in 44m` | Claude Code's idle compaction will act this idle period, in 44 minutes. |
-| Green tick | `idle compact on` | It is on, but not for this idle period: the context is under its floor, or the cache is cold. |
-| Grey struck-out ring | `idle compact off` | Neither it nor the fallback runs. |
-| Amber clock | `auto compact in 45m` | cache-keeper's fallback will compact in 45 minutes. |
-| Green tick | `auto compact on` | The fallback is on, but waits: no reply in this process yet, a context under its floor, or a cold cache. |
+| Amber clock | `idle compact in 44m` | An idle compaction, Claude Code's or the fallback's, will run this idle period, in 44 minutes. |
+| Green tick | `idle compact on` | It is on, but not for this idle period: the context is under its floor, the cache is cold, or no reply has finished in this process. |
+| Grey struck-out ring | `idle compact off` | Neither Claude Code's idle compaction nor the fallback runs. |
 
 The terminal draws the same states as `◷`, `●` and `○`.
-The rollout flag is read from `~/.claude.json` and the setting from `~/.claude/settings.json`; neither is changed.
+Neither file is changed by the mod.
+
+The rollout flag is read from `~/.claude.json` and the setting from `~/.claude/settings.json`.
 The timer is the mod's reading of how Claude Code 2.1.317 times it, not a figure Claude Code reports.
 
-## Auto compact fallback
+## Idle compact fallback
 
 For an account or session without Claude Code's idle compaction, or for a different idle time, turn the fallback on:
 
@@ -121,19 +145,32 @@ A compaction is one billed request and replaces detail with a summary, even if y
 `/cache-keeper compact off` turns the fallback off for one session.
 In an interactive session the mod compacts with a direct call; a desktop or SDK session refuses that call, so the mod runs `/compact` as if typed.
 
+## Keep awake
+
+`/cache-keeper awake on` or `off` sets it for every session, over the `keepAwake` option; the band's status line ends with `keep awake on` beside a green tick, or `keep awake off` beside a grey struck-out ring, the same icons as idle compaction.
+
+Keep awake exists because idle timers stop while the machine sleeps.
+Claude Code's own keep-awake holds only while a session works and lets go shortly after, so an idle session can sleep through its compaction time and wake to a cold cache.
+With keep awake on, the mod holds a request against idle sleep from the end of each turn until the compaction runs, the cache goes cold, or keepwarm ends, and only while an idle compaction or keepwarm is due.
+On Windows the hold is a hidden `pwsh` (or Windows PowerShell) process that calls `SetThreadExecutionState`; on macOS it is `caffeinate -i`, and on Linux `systemd-inhibit`.
+Ending the hold ends that process. A closed lid, the power button or a manual sleep still sleeps.
+
 ## Commands
 
 | Command | Effect |
 | --- | --- |
 | `/cache-keeper` | Shows cache state, usage left and settings. |
-| `/cache-keeper compact on\|off` | Sets the auto compact fallback for this session. |
-| `/keepwarm [6h\|90m\|off]` | Arms pings for a window, 6h by default and 168h at most. Auto compact waits until it ends. |
+| `/cache-keeper compact on\|off` | Sets the idle compact fallback for this session. |
+| `/cache-keeper awake on\|off` | Sets keep awake, for every session. |
+| `/cache-keeper motion on\|off` | Sets the band's animation, for every session; off freezes every drawing on its first frame. |
+| `/keepwarm [6h\|90m\|off]` | Arms pings for a window, 6h by default and 168h at most. Idle compaction waits until it ends. |
 
 ## Options
 
 | Option | Default | Values |
 | --- | --- | --- |
 | `autoCompact` | `off` | `off`, `on` |
+| `keepAwake` | `off` | `off`, `on` |
 | `compactAfter` | `auto` | `auto`, `55m`, `45m`, `30m`, `15m`, `5m` |
 | `guard` | `ask` | `ask`, `warn`, `off` |
 | `cacheTtl` | `1h` | `1h`, `5m` |
@@ -150,6 +187,10 @@ Set them in the config menu or under `pluginConfigs` in settings.
   Rates live in [hooks/logic.ts](hooks/logic.ts), checked 2026-11-05 against the `claude-api` skill of Claude Code 2.1.317.
 - Keepwarm does not start by itself, unlike cache-tax, because idle compaction covers the same idle time.
 - A draft left in the prompt box holds compaction back until the cache goes cold.
+- Idle timers do not run while Windows is in Modern Standby, since it suspends idle desktop apps, and Remote Control does not keep the machine awake; turn on keep awake for that.
+  An idle period that sleeps through the compaction time gets no compaction: on waking past the cache life the cache is cold, and compacting then would pay the full re-write.
+- Only the main conversation is compacted; a subagent's transcript never is.
+- Effort is set with `/effort`; where that fails the message goes on at the effort in force, and the log says so.
 - Claude Code's idle compaction is read from its rollout flag and settings as Claude Code 2.1.317 reads them; a later version may change either.
 - The hook API is early access and can change between Claude Code releases.
 
