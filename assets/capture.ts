@@ -15,11 +15,13 @@ if (!outDir) throw new Error('outDir required')
 const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
 const PORT = 9333
 const NOW = Date.parse('2026-11-05T12:00:00Z')
-const options = parseOptions({})
+// Claude Code's idle compaction on, as on an account in its rollout, so the band shows its timer.
+const options = { ...parseOptions({}), builtin: { minTokens: 200_000, fireAt: 0.9 } }
 const HOUR = 60 * MINUTE
 
-// Example figures only: a 180k context on Opus 5.5, priced by the mod's own table.
-const core = { ...EMPTY, tokens: 180_000, window: 1_000_000, model: 'claude-opus-5-5' }
+// Example figures only: a 240k context on Opus 5.5, priced by the mod's own table.
+const MODEL = 'claude-opus-5-5'
+const core = { ...EMPTY, tokens: 240_000, window: 1_000_000, model: MODEL, replyModel: MODEL }
 const rates = (sevenDay: number, fiveHour: number) => [
   { kind: 'seven_day', percentUsed: sevenDay, resetsAt: new Date(NOW + 121 * HOUR).toISOString() },
   { kind: 'five_hour', percentUsed: fiveHour, resetsAt: new Date(NOW + 3.2 * HOUR).toISOString() },
@@ -31,10 +33,11 @@ function drawings(state: State) {
   const value = {
     ...core,
     lastAt: NOW - state.idleMin * MINUTE,
+    byModel: { 'opus-5-5': NOW - state.idleMin * MINUTE },
     compacted: state.compacted ?? false,
     tokens: state.compacted ? 12_000 : core.tokens,
   }
-  const cache = cacheParts(value, NOW, options)!
+  const cache = cacheParts(value, NOW, options, MODEL)!
   const [a, b] = state.used ?? [11, 33]
 
   return {
