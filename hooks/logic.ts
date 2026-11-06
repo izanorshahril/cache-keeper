@@ -10,11 +10,14 @@ export const EMPTY: Core = {
   tokens: 0,
   window: 0,
   model: '',
+  replyModel: '',
   compacted: false,
   compactTried: false,
   noCompact: false,
   keepUntil: 0,
   updatedAt: 0,
+  byModel: {},
+  armed: false,
 }
 
 export type Options = {
@@ -22,15 +25,29 @@ export type Options = {
   guard: 'ask' | 'warn' | 'off'
   ttlMs: number
   minTokens: number
+  /** Idle time before the one auto compact: shortly before the cache goes cold, or the compactAfter duration. */
+  compactAt: number
+  /** Claude Code's own idle compaction, as read at session start; null where it is off. */
+  builtin: Builtin | null
 }
+
+/** Claude Code's idle compaction: it acts at a fraction of a 1h cache's life, on a context of at least minTokens. */
+export type Builtin = { minTokens: number; fireAt: number }
 
 export function parseOptions(raw: Readonly<Record<string, unknown>>): Options {
   const minTokens = Number(raw.minTokens)
 
+  const ttlMs = raw.cacheTtl === '5m' ? 5 * MINUTE : HOUR
+  const after = typeof raw.compactAfter === 'string' && raw.compactAfter !== 'auto' ? parseDuration(raw.compactAfter) : null
+
   return {
-    autoCompact: raw.autoCompact !== 'off',
+    // The fallback is off unless asked for: compaction replaces detail with a summary.
+    autoCompact: raw.autoCompact === 'on',
     guard: raw.guard === 'warn' || raw.guard === 'off' ? raw.guard : 'ask',
-    ttlMs: raw.cacheTtl === '5m' ? 5 * MINUTE : HOUR,
+    ttlMs,
+    // A compaction must start while the cache still serves it, so a longer setting is held a minute short of cold.
+    compactAt: after === null ? compactAtMs(ttlMs) : Math.min(after, ttlMs - MINUTE),
+    builtin: null,
     minTokens: Number.isFinite(minTokens) && minTokens > 0 ? minTokens : 50_000,
   }
 }
@@ -47,12 +64,14 @@ export type Idle = {
   options: Options
   isTurnRunning: boolean
   nextPingAt: number
+  /** A skipped or failed compaction waits until this time before it is tried again. */
+  nextCompactAt?: number
 }
 
 export type Action = 'none' | 'compact' | 'ping'
 
 /** The one decision the idle timer makes; `compacted` is what stops a recompact. */
-export function decide({ now, core, options, isTurnRunning, nextPingAt }: Idle): Action {
+export function decide({ now, core, options, isTurnRunning, nextPingAt, nextCompactAt = 0 }: Idle): Action {
   if (core.lastAt === 0 || isTurnRunning || core.compacted) return 'none'
 
   const idle = now - core.lastAt
@@ -64,13 +83,10 @@ export function decide({ now, core, options, isTurnRunning, nextPingAt }: Idle):
   }
 
   const canCompact =
-    options.autoCompact && !core.noCompact && !core.compactTried && core.tokens >= options.minTokens
+    options.autoCompact && core.armed && !core.noCompact && !core.compactTried && core.tokens >= options.minTokens
 
-  return canCompact && idle >= compactAtMs(options.ttlMs) ? 'compact' : 'none'
+  return canCompact && now >= nextCompactAt && idle >= options.compactAt ? 'compact' : 'none'
 }
-
-export const isCold = (core: Core, now: number, ttlMs: number) =>
-  core.lastAt > 0 && !core.compacted && now - core.lastAt >= ttlMs
 
 /** True when a ping read the cache rather than paying to write it again. */
 export const pingWasWarm = (read: number, written: number) => read > 0 && written < read * 0.1
@@ -86,34 +102,98 @@ export function parseDuration(text: string): number | null {
   return ms > 0 ? Math.min(ms, MAX_KEEP_MS) : null
 }
 
-export type Price = { read: number; write: number }
+export type Price = { name: string; read: number; write: number }
 
-// Dollars per million tokens: cache read, and the 1h cache write (2x input).
-// Checked 2026-11-05 against this Claude Code build's claude-api skill (cached
-// 2026-10-06). First match wins, so a specific id comes before its family.
-const PRICES: readonly [RegExp, number, number][] = [
-  [/(fable|mythos)-5-1/, 0.25, 20],
-  [/(fable|mythos)-5/, 1, 20],
-  [/opus-5-5/, 0.2, 8],
-  [/opus-5/, 0.5, 10],
-  [/opus-4/, 0.5, 10],
-  [/sonnet-5/, 0.2, 4],
-  [/sonnet-4/, 0.3, 6],
-  [/haiku-5-5/, 0.01, 0.2],
-  [/haiku-4/, 0.1, 2],
+// Dollars per million tokens: cache read, and the 1h cache write (2x input). The
+// name is the cache key, since each model keeps its own cache. Checked against the
+// claude-api skill's model table (cached 2026-10-06). First match wins, so a
+// specific id comes before its family.
+const PRICES: readonly [string, RegExp, number, number][] = [
+  ['fable-5-1', /(fable|mythos)-5-1/, 0.25, 20],
+  ['fable-5', /(fable|mythos)-5/, 1, 20],
+  ['opus-5-5', /opus-5-5/, 0.2, 8],
+  ['opus-5', /opus-5/, 0.5, 10],
+  ['opus-4', /opus-4/, 0.5, 10],
+  ['sonnet-5-5', /sonnet-5-5/, 0.2, 4],
+  ['sonnet-5', /sonnet-5/, 0.2, 4],
+  ['sonnet-4', /sonnet-4/, 0.3, 6],
+  ['haiku-5-5', /haiku-5-5/, 0.01, 0.2],
+  ['haiku-4', /haiku-4/, 0.1, 2],
 ]
 
-const HAIKU_LONG: Price = { read: 0.05, write: 1 }
+// Haiku 5.5 prices a prompt over 100K tokens at five times its base rate.
+const HAIKU_LONG = { read: 0.05, write: 1 }
+
+const ALIASES: Readonly<Record<string, string>> = {
+  fable: 'claude-fable-5-1',
+  opus: 'claude-opus-5-5',
+  sonnet: 'claude-sonnet-5-5',
+  haiku: 'claude-haiku-5-5',
+}
+
+/** The id a model name means: a bare alias takes its current model, and a `[1m]` suffix is dropped. */
+function canonical(model: string): string {
+  const bare = model.toLowerCase().replace(/\[.*\]$/, '').trim()
+
+  return (ALIASES[bare] ?? bare).replace(/[\s.]+/g, '-')
+}
 
 /** The rates for this model at this context size; null for a model not listed. */
 export function priceOf(model: string, tokens: number): Price | null {
-  const id = model.toLowerCase().replace(/[\s.]+/g, '-')
+  const id = canonical(model)
 
-  if (id.includes('haiku-5-5') && tokens > 100_000) return HAIKU_LONG
+  if (id.includes('haiku-5-5') && tokens > 100_000) return { name: 'haiku-5-5', ...HAIKU_LONG }
 
-  const row = PRICES.find(([pattern]) => pattern.test(id))
+  const row = PRICES.find(([, pattern]) => pattern.test(id))
 
-  return row ? { read: row[1], write: row[2] } : null
+  return row ? { name: row[0], read: row[2], write: row[3] } : null
+}
+
+/** A headless or SDK session refuses `$.session.compact`, and says so in this wording. */
+export const isHeadlessRefusal = (error: unknown): boolean => /headless|SDK session/i.test(String(error))
+
+const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
+
+/**
+ * Claude Code's own idle compaction, read the way Claude Code 2.1.317 reads it: a staged rollout
+ * (the tengu_sunny_locket flag cached in ~/.claude.json) that no setting turns on, and that
+ * `"idleCompaction": false` or auto-compact off turns off. It fires at 90% of a 1h cache's life,
+ * on a context of 200k tokens or more unless the rollout or CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS
+ * says otherwise (never under 100k).
+ */
+export function builtinIdle(config: unknown, settings: unknown, envMinTokens?: string): Builtin | null {
+  const flag = (config as { cachedGrowthBookFeatures?: { tengu_sunny_locket?: { mode?: unknown; minTokens?: unknown; fireAtFraction?: unknown } } } | null)
+    ?.cachedGrowthBookFeatures?.tengu_sunny_locket
+  const autoCompact = (config as { autoCompactEnabled?: unknown } | null)?.autoCompactEnabled
+  const s = settings as { idleCompaction?: unknown; autoCompactEnabled?: unknown } | null
+
+  if (flag?.mode !== 'compact' && flag?.mode !== 'compact_on_return') return null
+  if (s?.idleCompaction === false || s?.autoCompactEnabled === false || autoCompact === false) return null
+
+  const fromEnv = envMinTokens === undefined ? Number.NaN : Number(envMinTokens)
+  const min = Number.isFinite(fromEnv) ? fromEnv : flag.minTokens
+  const fraction = flag.fireAtFraction
+
+  return {
+    minTokens: finite(min) ? Math.max(100_000, min) : 200_000,
+    fireAt: finite(fraction) ? Math.min(0.95, Math.max(0.5, fraction)) : 0.9,
+  }
+}
+
+/** The cache key of a model: its price row, or its id when none is listed. */
+export const familyKey = (model: string): string => priceOf(model, 0)?.name ?? canonical(model)
+
+/** The model a reading means: a name the price table does not list ("default", "opusplan") is the last model selected. */
+export function resolveModel(selected: string, core: Core): string {
+  return priceOf(selected, 0) ? selected : core.model || selected
+}
+
+/** The label the band shows for a model, such as Opus. */
+export function shortName(model: string): string {
+  const key = familyKey(model)
+  const family = ['fable', 'opus', 'sonnet', 'haiku'].find(name => key.includes(name))
+
+  return family ? family.charAt(0).toUpperCase() + family.slice(1) : canonical(model)
 }
 
 export const usd = (value: number) => (value >= 100 ? `$${Math.round(value)}` : `$${value.toFixed(2)}`)
@@ -166,53 +246,158 @@ export function rateParts(rows: readonly RateRow[], now: number): RatePart[] {
     })
 }
 
+/** The write rate for the TTL in force: 2x input for 1h, 1.25x for 5m. */
+const writeRate = (price: Price, ttlMs: number) => (ttlMs <= 5 * MINUTE ? price.write * 0.625 : price.write)
+
+/** When this model last read or wrote the cache, as the session saw it; 0 when unused. */
+const lastOn = (core: Core, model: string): number => core.byModel?.[familyKey(model)] ?? 0
+
+/**
+ * Whether this model's cache still serves the next message. Caches are kept per
+ * model, and a compaction rewrites the prefix for all of them.
+ */
+export const isWarmOn = (core: Core, model: string, now: number, options: Options): boolean => {
+  const last = lastOn(core, model)
+
+  return !core.compacted && last > 0 && now - last < options.ttlMs
+}
+
+/** A message needs the cold-cache warning only off Haiku, with its model's cache cold and a large context. */
+export function needsWarning(core: Core, model: string, now: number, options: Options): boolean {
+  return shortName(model) !== 'Haiku' && !isWarmOn(core, model, now, options) && core.tokens >= options.minTokens
+}
+
+const SWITCH_TARGETS = ['claude-haiku-5-5', 'claude-sonnet-5-5']
+
+/** The models the warning offers as a switch: every target but the model in use. */
+export function switchTargets(model: string): string[] {
+  return SWITCH_TARGETS.filter(target => familyKey(target) !== familyKey(model))
+}
+
+export type NextCost = { label: string; usd: number; warm: boolean }
+
+/** What the next message costs on this model: a read if its cache is warm, else a write of the whole context. */
+export function nextCost(core: Core, model: string, now: number, options: Options): NextCost | null {
+  const price = priceOf(model, core.tokens)
+
+  if (!price) return null
+
+  const warm = isWarmOn(core, model, now, options)
+  const rate = warm ? price.read : writeRate(price, options.ttlMs)
+
+  return { label: shortName(model), usd: (core.tokens * rate) / 1e6, warm }
+}
+
+/** The current model of each family: what a switch is priced against. */
+export const ESTIMATE_MODELS = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']
+
+/** The next message's cost on every listed model, so a switch can be priced before it is made. */
+export function estimates(core: Core, now: number, options: Options): NextCost[] {
+  return ESTIMATE_MODELS.flatMap(model => {
+    const cost = nextCost(core, model, now, options)
+
+    return cost ? [cost] : []
+  })
+}
+
+/** How this model's cache stands, in words, for the guard's question. */
+export function coldState(core: Core, model: string, now: number, options: Options): string {
+  const last = lastOn(core, model)
+
+  if (last === 0) return 'has nothing cached yet'
+  if (core.compacted) return 'was compacted'
+
+  return `went cold ${span(now - last - options.ttlMs)} ago`
+}
+
+/**
+ * Idle compaction, always named so the feature is never a surprise: cache-keeper's fallback where
+ * it is on, else Claude Code's own, else off. A timer shows only when one will fire this idle.
+ */
+export function compactStatus(core: Core, now: number, options: Options, isWarm: boolean): string {
+  const sinceAny = Math.max(0, now - core.lastAt)
+
+  if (core.keepUntil > now && isWarm) return `keepwarm ${span(core.keepUntil - now)}`
+
+  if (options.autoCompact && !core.noCompact) {
+    const willFire = isWarm && core.armed && !core.compactTried && core.tokens >= options.minTokens
+
+    return willFire ? `auto compact in ${span(Math.max(0, options.compactAt - sinceAny))}` : 'auto compact on'
+  }
+
+  const builtin = options.builtin
+
+  if (builtin) {
+    const willFire = isWarm && options.ttlMs === HOUR && core.tokens >= builtin.minTokens
+
+    return willFire ? `idle compact in ${span(Math.max(0, builtin.fireAt * HOUR - sinceAny))}` : 'idle compact on'
+  }
+
+  return 'idle compact off'
+}
+
+/** What the compaction line means at a glance: a countdown runs, it is on but waits, or it is off. */
+export type PlanState = 'timer' | 'on' | 'off'
+
+/** The state a compaction line states in words, for the icon drawn beside it. */
+export function planStateOf(plan: string): PlanState {
+  if (plan.startsWith('keepwarm') || / in \d/.test(plan)) return 'timer'
+
+  return plan.endsWith(' off') ? 'off' : 'on'
+}
+
 export type CacheParts = {
   mode: 'warm' | 'cold' | 'compacted'
-  /** Time left, time idle, or the compacted size: the figure beside the chip. */
+  /** Time left or idle on the selected model, or the compacted size: the figure beside the chip. */
   time: string
-  cost: string | null
+  /** The model that prices the next message, and that price: `Opus $0.04`. */
+  cost: string
   plan: string | null
+  planState: PlanState | null
+  /** The summary without the compaction line, for a surface that draws that line on its own. */
+  lead: string
   /** The whole state in words, for a reader that cannot see the drawing. */
   summary: string
 }
 
-export function cacheParts(core: Core, now: number, options: Options): CacheParts | null {
+/** The cache as the selected model sees it: its own warm or cold state, and its price for the next message. */
+export function cacheParts(core: Core, now: number, options: Options, model: string): CacheParts | null {
   if (core.lastAt === 0) return null
 
   const size = tok(core.tokens)
+  const label = shortName(model)
 
   if (core.compacted) {
-    return { mode: 'compacted', time: size, cost: null, plan: null, summary: `Cache compacted to ${size}, waiting for your next message.` }
+    const summary = `Cache compacted to ${size}, waiting for your next message.`
+
+    return { mode: 'compacted', time: size, cost: label, plan: null, planState: null, lead: summary, summary }
   }
 
-  const idle = Math.max(0, now - core.lastAt)
-  const price = priceOf(core.model, core.tokens)
-  const warmCost = price ? usd((core.tokens * price.read) / 1e6) : null
-  const coldCost = price ? usd((core.tokens * price.write) / 1e6) : null
+  const price = nextCost(core, model, now, options)
+  const cost = price ? `${label} ${usd(price.usd)}` : label
+  const quote = price ? `, about ${usd(price.usd)}` : ''
+  const last = lastOn(core, model)
 
-  if (idle >= options.ttlMs) {
-    const time = span(idle)
-    const next = coldCost ? `, next message about ${coldCost}` : ''
+  if (!isWarmOn(core, model, now, options)) {
+    const time = last ? span(now - last) : 'not recorded'
+    const summary = last
+      ? `Cache cold on ${label}, ${time} idle, ${size} to re-write${quote}.`
+      : `No ${label} reply recorded in this session, so its cache is taken as cold: ${size} to write${quote}.`
 
-    return { mode: 'cold', time, cost: coldCost, plan: null, summary: `Cache cold, ${time} idle, ${size} to re-write${next}.` }
+    const plan = compactStatus(core, now, options, false)
+
+    return { mode: 'cold', time, cost, plan, planState: planStateOf(plan), lead: summary, summary: `${summary} ${plan}.` }
   }
 
-  const left = `${span(options.ttlMs - idle)} left`
-  const canCompact = options.autoCompact && !core.noCompact && !core.compactTried && core.tokens >= options.minTokens
-  const plan =
-    core.keepUntil > now
-      ? `keepwarm ${span(core.keepUntil - now)}`
-      : canCompact
-        ? `compacts in ${span(Math.max(0, compactAtMs(options.ttlMs) - idle))}`
-        : null
-  const next = warmCost ? `, next message about ${warmCost}, ${coldCost} once cold` : ''
+  const left = `${span(options.ttlMs - (now - last))} left`
+  const plan = compactStatus(core, now, options, true)
 
-  return { mode: 'warm', time: left, cost: warmCost, plan, summary: `Cache warm, ${left}, ${size}${next}.${plan ? ` ${plan}.` : ''}` }
+  const lead = `Cache warm on ${label}, ${left}, ${size}${quote}.`
+
+  return { mode: 'warm', time: left, cost, plan, planState: planStateOf(plan), lead, summary: `${lead} ${plan}.` }
 }
 
-/** The first line of `/cache-keeper`, and the terminal band's cache row. */
-export function cacheText(core: Core, now: number, options: Options): string | null {
-  const parts = cacheParts(core, now, options)
-
-  return parts && parts.summary
+/** The cache line for `/cache-keeper` and the terminal band. */
+export function cacheText(core: Core, now: number, options: Options, model: string): string | null {
+  return cacheParts(core, now, options, model)?.summary ?? null
 }

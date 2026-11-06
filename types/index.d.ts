@@ -5,7 +5,10 @@ export type Core = {
   /** The context, in tokens, as the last response reported it. */
   tokens: number
   window: number
+  /** The model last selected, as a name the price table lists. */
   model: string
+  /** The model that made the last main-thread request: what a resumed session's idle time belongs to. */
+  replyModel: string
   /** Compacted, by anyone, with no real turn since: nothing more to compact. */
   compacted: boolean
   /** Auto compact already tried this idle period, whatever came of it. */
@@ -14,6 +17,10 @@ export type Core = {
   noCompact: boolean
   /** Keepwarm pings run until this time; 0 when off. */
   keepUntil: number
+  /** When each model last read or wrote this session's cache, keyed by price row (opus-5-5). */
+  byModel: Record<string, number>
+  /** A turn has finished: a mirror for reading the store; auto compact goes by the process's own flag. */
+  armed: boolean
   updatedAt: number
 }
 

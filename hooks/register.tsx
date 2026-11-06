@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Core, RateRow } from '../types'
-import { BG, MODE_HUE, MUTED, TONE, mascotSvg, statusSvg, usageSvg } from './art'
+import { BG, MODE_HUE, MUTED, PLAN_GLYPH, PLAN_HUE, TONE, mascotSvg, statusSvg, usageSvg } from './art'
 import type { Options } from './logic'
 import {
   DEFAULT_KEEP_MS,
@@ -12,12 +12,22 @@ import {
   cacheParts,
   cacheText,
   decide,
-  isCold,
+  coldState,
+  estimates,
+  familyKey,
+  builtinIdle,
+  isHeadlessRefusal,
+  isWarmOn,
+  needsWarning,
+  switchTargets,
+  nextCost,
+  shortName,
   parseDuration,
   parseOptions,
   pingWasWarm,
   priceOf,
   rateParts,
+  resolveModel,
   span,
   tok,
   usd,
@@ -27,6 +37,7 @@ const core = atom({ plugin: 'cache-keeper', key: 'core' } as const, EMPTY)
 const rate = atom({ plugin: 'cache-keeper', key: 'rate' } as const, [] as RateRow[])
 
 const TICK_MS = 30_000
+const COMPACT_RETRY_MS = 2 * MINUTE
 const MAX_PING_RETRIES = 3
 const STALE_AFTER_MS = 7 * 24 * HOUR
 const ATTENDED = new Set<string>(['composer', 'bridge', 'sdk'])
@@ -34,7 +45,24 @@ const ATTENDED = new Set<string>(['composer', 'bridge', 'sdk'])
 const RATE_KEY = 'rate'
 const sessionKey = (id: string) => `session:${id}`
 
+// The session whose saved record is in `core`. A resume can raise its hooks before session start,
+// and a write then must build on the saved record, not on an empty one.
+let loadedFor = ''
+
+async function ensureLoaded($: EngineInterface): Promise<void> {
+  const id = await $.session.id()
+
+  if (loadedFor === id) return
+
+  loadedFor = id
+
+  const stored = (await $.store.get(sessionKey(id))) as Partial<Core> | undefined
+
+  await update($, core, () => ({ ...EMPTY, ...stored, byModel: { ...stored?.byModel } }))
+}
+
 async function patch($: EngineInterface, change: (value: Core) => Core): Promise<void> {
+  await ensureLoaded($)
   await update($, core, value => change(value ?? EMPTY))
 
   const next = await read($, core)
@@ -59,8 +87,13 @@ let isTurnRunning = false
 let isBusy = false
 let isCompacting = false
 let nextPingAt = 0
+let nextCompactAt = 0
 let pingRetries = 0
 let cancelTick: (() => void) | null = null
+// Compaction is a direct call in an interactive session, and a /compact turn where the engine refuses the call.
+let viaCommand = false
+// A turn has finished in this process. In memory, so a host that re-runs session start cannot clear it.
+let armedHere = false
 
 /**
  * Usage is the account's, not the session's, so every session shows the newest
@@ -90,32 +123,68 @@ async function measure($: EngineInterface): Promise<void> {
 
   await patch($, c => ({
     ...c,
-    model: model || c.model,
+    model: priceOf(model, 0) ? model : c.model,
     window: usage.context.window,
     tokens: tokens && tokens > 0 ? tokens : c.tokens,
   }))
 }
 
-async function runCompact($: EngineInterface, idleMs: number): Promise<void> {
+async function readJson($: EngineInterface, file: string): Promise<unknown> {
+  try {
+    return JSON.parse(await $.fs.read(file))
+  } catch {
+    return null
+  }
+}
+
+// Only what decides Claude Code's own idle compaction is read from its config and settings; nothing is kept.
+async function readBuiltin($: EngineInterface) {
+  const configDir = await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)
+  const home = (await $.env.get('HOME').catch(() => undefined)) ?? (await $.env.get('USERPROFILE').catch(() => undefined))
+  // With CLAUDE_CONFIG_DIR set, .claude.json lives in it; otherwise in the home folder, beside .claude.
+  const configFile = configDir ? `${configDir}/.claude.json` : home ? `${home}/.claude.json` : undefined
+  const settingsFile = configDir ? `${configDir}/settings.json` : home ? `${home}/.claude/settings.json` : undefined
+  const config = configFile ? await readJson($, configFile) : null
+  const settings = settingsFile ? await readJson($, settingsFile) : null
+
+  return builtinIdle(config, settings, await $.env.get('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS').catch(() => undefined))
+}
+
+async function runCompact($: EngineInterface, idleMs: number, now: number): Promise<void> {
   isCompacting = true
-  // Set first and left set: one attempt per idle period, even if it fails.
-  await patch($, c => ({ ...c, compactTried: true }))
 
   try {
     const before = (await read($, core)).tokens
-    const result = await $.session.compact()
 
-    if (result.skip !== undefined) {
-      $.ui.log(`cache-keeper: auto compact skipped: ${result.skip}`, { to: 'debug' })
-      return
+    if (!viaCommand) {
+      try {
+        const result = await $.session.compact()
+
+        if (result.skip !== undefined) {
+          nextCompactAt = now + COMPACT_RETRY_MS
+          $.ui.log(`cache-keeper: auto compact skipped after ${span(idleMs)} idle: ${result.skip}. Trying again in 2m.`)
+          return
+        }
+
+        const after = result.tokensAfter ?? 0
+
+        await patch($, c => ({ ...c, compacted: true, compactTried: true, tokens: after > 0 ? after : c.tokens }))
+        $.ui.log(`cache-keeper: compacted ${tok(before)} to ${tok(after)} after ${span(idleMs)} idle, before the cache went cold.`)
+        return
+      } catch (error) {
+        if (!isHeadlessRefusal(error)) throw error
+        // The engine compacts a headless or SDK session only inside a turn, so /compact runs as if typed from now on.
+        viaCommand = true
+      }
     }
 
-    const after = result.tokensAfter ?? 0
-
-    await patch($, c => ({ ...c, compacted: true, tokens: after > 0 ? after : c.tokens }))
-    $.ui.log(`cache-keeper: compacted ${tok(before)} to ${tok(after)} after ${span(idleMs)} idle, before the cache went cold.`)
+    await $.command.run({ command: 'compact', args: '' })
+    // The engine may not report the size after a /compact turn, so the last figure stays until the next reply.
+    await patch($, c => ({ ...c, compacted: true, compactTried: true }))
+    $.ui.log(`cache-keeper: compacted with /compact after ${span(idleMs)} idle, before the cache went cold.`)
   } catch (error) {
-    $.ui.log(`cache-keeper: auto compact failed: ${String(error)}`, { to: 'debug' })
+    nextCompactAt = now + COMPACT_RETRY_MS
+    $.ui.log(`cache-keeper: auto compact failed after ${span(idleMs)} idle: ${String(error)}. Trying again in 2m.`)
   } finally {
     isCompacting = false
   }
@@ -164,7 +233,7 @@ async function tick($: EngineInterface, options: Options): Promise<void> {
 
     const now = await $.clock.now()
     const value = await read($, core)
-    const action = decide({ now, core: value, options, isTurnRunning, nextPingAt })
+    const action = decide({ now, core: { ...value, armed: armedHere }, options, isTurnRunning, nextPingAt, nextCompactAt })
 
     if (action === 'none') return
 
@@ -181,9 +250,21 @@ async function tick($: EngineInterface, options: Options): Promise<void> {
     // Someone is typing: leave the context as it is.
     if ((await $.prompt.read()).text.trim() !== '') return
 
-    await runCompact($, now - value.lastAt)
+    await runCompact($, now - value.lastAt, now)
   } finally {
     isBusy = false
+  }
+}
+
+// Puts the text back in the box where the surface has one; otherwise the notice carries it.
+async function keepText($: EngineInterface, text: string, why: string) {
+  const isRestored = await $.prompt.fill({ text }).then(
+    filled => filled.isFilled,
+    () => false,
+  )
+
+  return {
+    drop: isRestored ? `cache-keeper: ${why}, your text is back in the box.` : `cache-keeper: ${why}. Your text: ${text.slice(0, 3500)}`,
   }
 }
 
@@ -191,6 +272,8 @@ export const register: Register = (on, rawOptions) => {
   const options = parseOptions(rawOptions as Readonly<Record<string, unknown>>)
 
   on('session.start', async ($, e, next) => {
+    viaCommand = !e.isInteractive
+    options.builtin = await readBuiltin($)
     await $.command.register({
       name: 'cache-keeper',
       description: 'Shows the prompt cache state; "compact on" or "compact off" sets auto compact for this session.',
@@ -203,10 +286,10 @@ export const register: Register = (on, rawOptions) => {
     })
 
     const now = await $.clock.now()
-    const stored = (await $.store.get(sessionKey(await $.session.id()))) as Partial<Core> | undefined
 
-    if (stored) await update($, core, () => ({ ...EMPTY, ...stored }))
-
+    // Read again: the store holds anything a hook raised before this one wrote.
+    loadedFor = ''
+    await ensureLoaded($)
     await pruneStore($, now)
     await measure($)
 
@@ -237,12 +320,23 @@ export const register: Register = (on, rawOptions) => {
       const seconds = e.seconds_since_last_response
       const tokens = e.context_tokens
 
-      await patch($, c => ({
-        ...c,
-        lastAt: c.lastAt === 0 && seconds !== undefined ? now - seconds * 1000 : c.lastAt,
-        tokens: c.tokens === 0 && tokens ? tokens : c.tokens,
-        model: c.model || e.model || '',
-      }))
+      await patch($, c => {
+        if (seconds === undefined) return { ...c, tokens: c.tokens === 0 && tokens ? tokens : c.tokens }
+
+        const lastResponse = now - seconds * 1000
+        // The last response was made by the model that last replied, which `e.model`, the model the
+        // session resumes on, need not be.
+        const replied = c.replyModel || e.model || ''
+        const key = replied ? familyKey(replied) : ''
+
+        return {
+          ...c,
+          lastAt: Math.max(c.lastAt, lastResponse),
+          tokens: c.tokens === 0 && tokens ? tokens : c.tokens,
+          model: c.model || e.model || '',
+          byModel: key ? { ...c.byModel, [key]: Math.max(c.byModel?.[key] ?? 0, lastResponse) } : c.byModel,
+        }
+      })
     }
 
     return next(e)
@@ -269,7 +363,7 @@ export const register: Register = (on, rawOptions) => {
       // The cache TTL runs from the start of the request.
       const now = await $.clock.now()
 
-      await patch($, c => ({ ...c, lastAt: now }))
+      await patch($, c => ({ ...c, lastAt: now, replyModel: e.model, byModel: { ...c.byModel, [familyKey(e.model)]: now } }))
     }
 
     return yield* next(e)
@@ -278,6 +372,7 @@ export const register: Register = (on, rawOptions) => {
   on('turn.complete', async ($, e, next) => {
     if (!e.agentId) {
       isTurnRunning = false
+      armedHere = true
 
       const now = await $.clock.now()
       const model = e.usage?.model
@@ -286,7 +381,12 @@ export const register: Register = (on, rawOptions) => {
         ...c,
         // Only a turn no step stamped, and one that really made a request.
         lastAt: e.usage && now - c.lastAt > e.durationMs ? now : c.lastAt,
+        armed: true,
         model: model || c.model,
+        replyModel: model || c.replyModel,
+        byModel: model
+          ? { ...c.byModel, [familyKey(model)]: Math.max(c.byModel?.[familyKey(model)] ?? 0, e.usage && now - c.lastAt > e.durationMs ? now : c.lastAt) }
+          : c.byModel,
       }))
       await measure($)
     }
@@ -312,45 +412,63 @@ export const register: Register = (on, rawOptions) => {
     const now = await $.clock.now()
     const value = await read($, core)
 
-    if (!isCold(value, now, options.ttlMs) || value.tokens < options.minTokens) return next(e)
+    const selected = resolveModel(await $.session.model(), value)
 
-    const price = priceOf(value.model, value.tokens)
-    const cost = price ? usd((value.tokens * price.write) / 1e6) : null
-    const estimate = cost ? `about ${cost} at list price` : 'an unpriced model'
-    const coldFor = span(now - value.lastAt - options.ttlMs)
+    if (!needsWarning(value, selected, now, options)) return next(e)
+
+    const label = shortName(selected)
+    const price = nextCost(value, selected, now, options)
+    const cost = price ? usd(price.usd) : null
+    const coldFor = coldState(value, selected, now, options)
 
     if (options.guard === 'warn') {
-      $.ui.log(`cache-keeper: cold send, re-writing ${tok(value.tokens)} tokens, ${estimate}.`)
+      $.ui.log(`cache-keeper: the ${label} cache ${coldFor}; this message re-writes ${tok(value.tokens)} tokens${cost ? `, about ${cost}` : ''}.`)
       return next(e)
     }
 
-    const send = cost ? `Send anyway (${cost})` : 'Send anyway'
+    // A message with attachments stays on its model: they do not survive a re-send.
+    const switches = e.attachments?.length
+      ? []
+      : switchTargets(selected).map(model => {
+          const quote = nextCost(value, model, now, options)
+
+          return { model, text: `Switch to ${shortName(model)}${quote ? ` (${usd(quote.usd)})` : ''}` }
+        })
+    const send = `Send on ${label}${cost ? ` (${cost})` : ''}`
     let answer: string
 
     try {
       answer = await $.ui.ask(
-        `The prompt cache went cold ${coldFor} ago. This message re-writes ${tok(value.tokens)} tokens, ${estimate}. Send it?`,
-        { header: 'Cold cache', options: [send, "Don't send"] },
+        `The ${label} prompt cache ${coldFor}. This message re-writes ${tok(value.tokens)} tokens. Send it on ${label}, or switch model first?`,
+        { header: 'Cold cache', options: [send, ...switches.map(option => option.text), "Don't send"] },
       )
     } catch {
       // A dialog that could not be shown must never eat a prompt.
-      $.ui.log(`cache-keeper: cold send, re-writing ${tok(value.tokens)} tokens, ${estimate}.`)
+      $.ui.log(`cache-keeper: the ${label} cache ${coldFor}; this message re-writes ${tok(value.tokens)} tokens.`)
       return next(e)
     }
 
     if (answer === send) return next(e)
 
-    // A surface with no prompt box cannot take the text back, so the notice carries it.
-    const isRestored = await $.prompt.fill({ text: e.text }).then(
-      filled => filled.isFilled,
-      () => false,
-    )
+    const picked = switches.find(option => option.text === answer)
 
-    return {
-      drop: isRestored
-        ? 'cache-keeper: not sent, your text is back in the box. Use /compact or send it when ready.'
-        : `cache-keeper: not sent. Your text: ${e.text.slice(0, 3500)}`,
+    if (picked) {
+      const target = shortName(picked.model)
+
+      try {
+        await $.command.run({ command: 'model', args: picked.model })
+      } catch (error) {
+        $.ui.log(`cache-keeper: could not switch to ${target}: ${String(error)}`)
+        return keepText($, e.text, `the switch to ${target} failed, so nothing was sent`)
+      }
+
+      // Re-sent on the new model. Not awaited: the call resolves only when its turn starts, which waits for this prompt to end.
+      void $.prompt.submit({ text: e.text }).catch(error => $.ui.log(`cache-keeper: re-send failed: ${String(error)}`))
+
+      return { drop: `cache-keeper: sent on ${target} instead.` }
     }
+
+    return keepText($, e.text, 'not sent')
   })
 
   on('command.run', { command: 'cache-keeper' }, async ($, e) => {
@@ -368,14 +486,23 @@ export const register: Register = (on, rawOptions) => {
     const rows = rateParts(await read($, rate), now).map(
       part => `${part.name} ${part.left}%${part.isLow ? ' LOW' : ''}${part.reset ? ` (${part.reset})` : ''}`,
     )
-    const cache = cacheText(value, now, options) ?? 'Cache: no request yet.'
-    const autoCompact = options.autoCompact && !value.noCompact ? 'on' : 'off'
+    const selected = resolveModel(await $.session.model(), value)
+    const cache = cacheText(value, now, options, selected) ?? 'Cache: no request yet.'
+    const table = estimates(value, now, options)
+      .map(est => `${est.label} ${usd(est.usd)} (${est.warm ? 'read' : 'write'})`)
+      .join(', ')
+    const autoCompact = options.autoCompact && !value.noCompact
+      ? `cache-keeper, after ${span(options.compactAt)} idle`
+      : options.builtin
+        ? `Claude Code's idle compaction, at ${span(options.builtin.fireAt * HOUR)} idle on ${tok(options.builtin.minTokens)}+ tokens`
+        : 'off'
 
     return {
       text: [
         cache,
+        `Next message by model: ${table}.`,
         ...(rows.length ? [`usage left: ${rows.join(', ')}`] : []),
-        `auto compact: ${autoCompact}, floor ${tok(options.minTokens)}; guard: ${options.guard}; cache TTL: ${span(options.ttlMs)}`,
+        `idle compaction: ${autoCompact}; floor ${tok(options.minTokens)}; guard: ${options.guard}; cache TTL: ${span(options.ttlMs)}`,
         'Dollar figures are API list-price estimates, not subscription charges.',
       ].join('\n'),
     }
@@ -411,7 +538,8 @@ export const register: Register = (on, rawOptions) => {
     const now = await $.clock.now()
     const value = await read($, core)
     const rows = await read($, rate)
-    const cache = cacheParts(value, now, options)
+    const selected = resolveModel(await $.session.model(), value)
+    const cache = cacheParts({ ...value, armed: armedHere }, now, options, selected)
 
     if (!cache && rows.length === 0) return next(e)
 
@@ -440,7 +568,17 @@ export const register: Register = (on, rawOptions) => {
               ))}
             </Box>
           ) : null}
-          {cache ? <Text color={MODE_HUE[cache.mode]}>{cache.summary}</Text> : null}
+          {cache ? (
+            <Box flexDirection="row" flexWrap="wrap">
+              <Text color={MODE_HUE[cache.mode]}>{cache.lead}</Text>
+              {cache.plan && cache.planState ? (
+                <Text color={PLAN_HUE[cache.planState]}>
+                  {' '}
+                  {PLAN_GLYPH[cache.planState]} {cache.plan}
+                </Text>
+              ) : null}
+            </Box>
+          ) : null}
         </Box>
       )
     }

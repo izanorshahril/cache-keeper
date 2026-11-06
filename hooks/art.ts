@@ -2,7 +2,7 @@
 // Motion is CSS only, so a reduced-motion setting stops all of it.
 
 import { ADVANCE, FONT } from './font'
-import type { CacheParts, RatePart, Tone } from './logic'
+import type { CacheParts, PlanState, RatePart, Tone } from './logic'
 
 export const BG = '#24221c'
 export const TEXT = '#e8e2d2'
@@ -136,6 +136,40 @@ export function usageSvg(parts: readonly RatePart[], cells: number): Drawing {
 
 // ---------- Cache status ----------
 
+/** The compaction state's colour; each state also has its own shape, so colour is never the only cue. */
+export const PLAN_HUE: Readonly<Record<PlanState, string>> = { timer: '#f5b342', on: '#4eba65', off: MUTED }
+
+/** A terminal's stand-in for the icon: a clock face, a filled dot, an empty one. */
+export const PLAN_GLYPH: Readonly<Record<PlanState, string>> = { timer: '◷', on: '●', off: '○' }
+
+const PLAN_ICON = 12
+
+/** The compaction icon, 12px square from x, centred on cy: a clock, a ticked disc, or a struck-out ring. */
+function planIcon(state: PlanState, x: number, cy: number): string {
+  const cx = x + PLAN_ICON / 2
+  const hue = PLAN_HUE[state]
+
+  if (state === 'timer') {
+    return (
+      `<circle cx="${cx}" cy="${cy}" r="5" fill="none" stroke="${hue}" stroke-width="1.6"/>` +
+      `<path d="M${cx} ${cy}V${cy - 3.2}" stroke="${hue}" stroke-width="1.5" stroke-linecap="round"/>` +
+      `<path class="hand" d="M${cx} ${cy}H${cx + 2.6}" stroke="${hue}" stroke-width="1.5" stroke-linecap="round" style="transform-origin:${cx}px ${cy}px"/>`
+    )
+  }
+
+  if (state === 'on') {
+    return (
+      `<circle cx="${cx}" cy="${cy}" r="5.6" fill="${hue}"/>` +
+      `<path d="M${cx - 2.6} ${cy + 0.1}l1.8 1.8 3.4-3.6" fill="none" stroke="${INK}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>`
+    )
+  }
+
+  return (
+    `<circle cx="${cx}" cy="${cy}" r="5" fill="none" stroke="${hue}" stroke-width="1.5"/>` +
+    `<path d="M${cx - 3.5} ${cy + 3.5}L${cx + 3.5} ${cy - 3.5}" stroke="${hue}" stroke-width="1.5" stroke-linecap="round"/>`
+  )
+}
+
 /** The chip, with a light sweeping across it, then the time, cost and plan. */
 export function statusSvg(cache: CacheParts): Drawing {
   const hue = MODE_HUE[cache.mode]
@@ -146,20 +180,34 @@ export function statusSvg(cache: CacheParts): Drawing {
   const left = 7
   const top = 7
   const y = 21.5
-  const text = runs(
+  const lead = runs(
     [
       { text: cache.time, size: 13.5, weight: 700, fill: hue },
       ...(cache.cost ? [{ text: `· ${cache.cost}`, size: 13.5, weight: 700, fill: TEXT, gap: 5 }] : []),
-      ...(cache.plan ? [{ text: `· ${cache.plan}`, size: 12.5, weight: 500, fill: MUTED, gap: 5 }] : []),
     ],
     left + chipWidth + 8,
     y,
   )
+  let plan = ''
+  let end = lead.end
+
+  if (cache.plan) {
+    const state = cache.planState ?? 'on'
+    const dot = runs([{ text: '·', size: 12.5, weight: 500, fill: MUTED, gap: 5 }], end, y)
+    const iconX = dot.end + 5
+    const words = runs([{ text: cache.plan, size: 12.5, weight: 600, fill: state === 'off' ? MUTED : TEXT, opacity: state === 'off' ? 1 : 0.88 }], iconX + PLAN_ICON + 4, y)
+
+    plan = dot.svg + `<g role="img" aria-label="${state}">${planIcon(state, iconX, y - 4.4)}</g>` + words.svg
+    end = words.end
+  }
+
+  const text = { svg: lead.svg + plan, end }
   const width = Math.ceil(text.end + 2)
   const height = 34
   const css =
     '.chip{animation:halo 2.8s ease-in-out infinite}@keyframes halo{50%{filter:drop-shadow(0 0 3.5px ' + hue + ')}}' +
-    '.sweep{animation:sweep 4.5s ease-in-out infinite}@keyframes sweep{0%,55%{transform:translateX(-30px)}100%{transform:translateX(' + (chipWidth + 30) + 'px)}}'
+    '.sweep{animation:sweep 4.5s ease-in-out infinite}@keyframes sweep{0%,55%{transform:translateX(-30px)}100%{transform:translateX(' + (chipWidth + 30) + 'px)}}' +
+    '.hand{animation:hand 6s linear infinite}@keyframes hand{to{transform:rotate(360deg)}}'
   const body =
     `<defs><clipPath id="c"><rect x="${left}" y="${top}" width="${chipWidth}" height="${chipHeight}" rx="6.5"/></clipPath></defs>` +
     `<g class="chip"><rect x="${left}" y="${top}" width="${chipWidth}" height="${chipHeight}" rx="6.5" fill="${hue}"/></g>` +
