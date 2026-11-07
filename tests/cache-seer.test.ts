@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { MODE_HUE, mascotSvg, statusSvg, usageSvg } from '../hooks/art'
-import { CHOICE_HUE, EMPTY, wantsAwake, HOUR, MINUTE, cacheParts, coldCase, coldChoices, compactModels, planStateOf, compactAtMs, decide, estimates, builtinIdle, isHeadlessRefusal, lowerModels, needsWarning, nextCost, resolveModel, parseDuration, parseOptions, priceOf, rateParts, toneOf } from '../hooks/logic'
+import { EMPTY, aheadOfBuiltin, wantsAwake, HOUR, MINUTE, cacheParts, coldCase, coldChoices, compactModels, planStateOf, compactAtMs, decide, estimates, builtinIdle, isHeadlessRefusal, lowerModels, needsWarning, nextCost, resolveModel, parseDuration, parseOptions, priceOf, rateParts, toneOf } from '../hooks/logic'
 
 const options = parseOptions({ autoCompact: 'on' })
 const warm = { ...EMPTY, lastAt: 1000, tokens: 180_000, model: 'claude-opus-5-5', byModel: { 'opus-5-5': 1000 }, armed: true }
@@ -143,7 +143,6 @@ test('each of the four cold cases offers its own choices', () => {
   expect(coldChoices('haiku-large', opus)).toEqual(['send', 'compact', 'cancel'])
   expect(coldChoices('haiku-haiku', haiku)).toEqual(['send', 'cancel'])
 
-  expect([CHOICE_HUE.send, CHOICE_HUE.switch, CHOICE_HUE.compact, CHOICE_HUE.cancel]).toEqual(['error', 'warning', 'warning', undefined])
 })
 
 test('a lower model is any family below; compaction picks any model only from large to large', () => {
@@ -185,8 +184,8 @@ test('estimates price every model the mod lists', () => {
 test('usage reads blue, amber, orange, then red as it runs out', () => {
   expect([80, 51, 50, 26, 25, 15, 14.9].map(toneOf)).toEqual(['ok', 'ok', 'watch', 'watch', 'high', 'high', 'critical'])
   expect(rateParts([{ kind: 'five_hour', percentUsed: 90 }, { kind: 'seven_day', percentUsed: 55 }], 0)).toMatchObject([
-    { name: '7D', left: 45, tone: 'watch', isLow: false },
     { name: '5H', left: 10, tone: 'critical', isLow: true },
+    { name: '7D', left: 45, tone: 'watch', isLow: false },
   ])
 })
 
@@ -277,7 +276,7 @@ test('an idle session compacts once and only once', { options: { autoCompact: 'o
 })
 
 const BAND = {
-  plugin: 'cache-keeper',
+  plugin: 'cache-seer',
   component: 'AbovePrompt',
   requestId: 'band',
   props: { hasSurvey: false, bodyColumns: 120, view: {} },
@@ -353,7 +352,7 @@ test('a running session picks up the reading another session saved', async ($, o
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function coldSession($: any, on: any, model = 'claude-opus-5-5', answers: string[] = []) {
   const clock = mock.clock(on, { now: 1000 })
-  const seen = { filled: '', runs: [] as string[], sent: [] as string[], compactions: 0, asked: [] as string[], logs: [] as string[], model, clock }
+  const seen = { filled: '', runs: [] as string[], sent: [] as string[], compactions: 0, asked: [] as string[], options: [] as string[][], logs: [] as string[], model, clock }
 
   mock.store(on)
   standIn(
@@ -366,10 +365,12 @@ async function coldSession($: any, on: any, model = 'claude-opus-5-5', answers: 
     () => seen.filled,
     text => seen.logs.push(text),
   )
-  on('tool.call', (_: unknown, e: { questions: { question: string }[] }) => {
-    const question = e.questions[0]?.question ?? ''
+  on('tool.call', (_: unknown, e: { questions: { question: string; options?: unknown[] }[] }) => {
+    const first = e.questions[0]
+    const question = first?.question ?? ''
 
     seen.asked.push(question)
+    seen.options.push((first?.options ?? []).map(option => (typeof option === 'string' ? option : (option as { label: string }).label)))
     return { result: { questions: [], answers: { [question]: answers.shift() ?? 'Cancel' } } }
   })
   on('prompt.fill', (_: unknown, e: { text: string }) => {
@@ -396,146 +397,90 @@ async function coldSession($: any, on: any, model = 'claude-opus-5-5', answers: 
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const send = ($: any, text: string, kind = 'composer') => $.prompt.submit({ text, origin: { kind }, wait: false }) as Promise<{ drop?: string; text?: string }>
-const buttons = async (ui: { findAll: (q: object) => Promise<{ key: string | undefined; props: Record<string, unknown> }[]> }) =>
-  (await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('cold-'))
-
-test('a cold send from large to large holds the text and asks in the band, colored', { options: { autoCompact: 'off' } }, async ($, on) => {
-  const seen = await coldSession($, on)
+test('a cold send asks once in the question box, and Cancel puts the text back', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-opus-5-5', ['Cancel'])
   const result = await send($, 'back again')
 
-  expect(result.drop).toContain('pick how to send it')
+  expect(seen.asked).toHaveLength(1)
+  expect(seen.asked[0]).toMatch(/^Opus went cold .* Sending rebuilds this conversation, about \$1\.44\.$/)
+  expect(seen.options).toEqual([['Send on Opus', 'Use a cheaper model', 'Summarize first', 'Cancel']])
+  expect(result.drop).toBe('Not sent. Your message is back in the box.')
   expect(seen.filled).toBe('back again')
-
-  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
-
-  expect((await buttons(ui)).map(b => b.props.label)).toEqual([expect.stringMatching(/^Continue on Opus \(\$/), 'Continue on a lower model', 'Compact first', 'Cancel'])
-  expect((await ui.find({ type: 'Text', text: /^Continue on Opus/ }))?.props.color).toBe('error')
-  expect((await ui.find({ type: 'Text', text: 'Continue on a lower model' }))?.props.color).toBe('warning')
-  expect((await ui.find({ type: 'Text', text: 'Compact first' }))?.props.color).toBe('warning')
-
-  for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
-    const other = await $.ui.mount({ ...(BAND as object), surface } as never)
-
-    expect((await buttons(other)).map(b => b.key)).toEqual(['cold-send', 'cold-switch', 'cold-compact', 'cold-cancel'])
-    await other.unmount()
-  }
-
-  // Cancel leaves the text in the box and sends nothing.
-  await ui.press({ key: 'cold-cancel' })
-  expect(await buttons(ui)).toEqual([])
   expect(seen.sent).toEqual([])
-  expect(seen.filled).toBe('back again')
-  await ui.unmount()
 })
 
-test('continuing on a lower model picks the model and the effort, then sends', { options: { autoCompact: 'off' } }, async ($, on) => {
-  const seen = await coldSession($, on)
+test('a switch to a lower model asks which model and effort, then sends on it', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-opus-5-5', ['Use a cheaper model', 'Haiku ($0.18)', 'max'])
+  const result = await send($, 'go on')
 
-  await send($, 'go on')
-
-  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
-
-  await ui.press({ key: 'cold-switch' })
-  expect((await buttons(ui)).map(b => b.key)).toEqual(['cold-model-sonnet-5-5', 'cold-model-haiku-5-5', 'cold-cancel'])
-  await ui.press({ key: 'cold-model-haiku-5-5' })
-  expect((await buttons(ui)).map(b => b.key)).toEqual(['cold-effort-low', 'cold-effort-medium', 'cold-effort-high', 'cold-effort-xhigh', 'cold-effort-max', 'cold-cancel'])
-  await ui.press({ key: 'cold-effort-max' })
+  expect(result.drop).toBe('Switching to Haiku, then sending your message.')
+  expect(seen.options.slice(1)).toEqual([['Sonnet ($0.72)', 'Haiku ($0.18)'], ['low', 'medium', 'high', 'xhigh']])
+  for (let i = 0; i < 5 && seen.sent.length < 1; i += 1) await seen.clock.advance(1)
 
   expect(seen.runs).toEqual(['model claude-haiku-5-5', 'effort max'])
-  expect(seen.sent.at(-1)).toBe('go on')
-  expect(seen.filled).toBe('')
-  await ui.unmount()
+  expect(seen.sent).toEqual(['go on'])
 })
 
-test('compacting first runs on the model and effort picked, then sends on the model typed for', { options: { autoCompact: 'off' } }, async ($, on) => {
-  const seen = await coldSession($, on)
+test('summarizing first asks which model and effort, then sends on the model typed for', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-opus-5-5', ['Summarize first', 'Haiku ($0.18)', 'low'])
+  const result = await send($, 'go on')
 
-  await send($, 'go on')
-
-  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
-
-  await ui.press({ key: 'cold-compact' })
-  expect((await buttons(ui)).map(b => b.key)).toEqual(['cold-model-haiku-5-5', 'cold-model-sonnet-5-5', 'cold-model-opus-5-5', 'cold-model-fable-5-1', 'cold-cancel'])
-  await ui.press({ key: 'cold-model-haiku-5-5' })
-  await ui.press({ key: 'cold-effort-low' })
+  expect(result.drop).toBe('Summarizing with Haiku, then sending your message on Opus.')
+  for (let i = 0; i < 5 && seen.sent.length < 1; i += 1) await seen.clock.advance(1)
 
   expect(seen.compactions).toBe(1)
   expect(seen.runs).toEqual(['model claude-haiku-5-5', 'effort low', 'model claude-opus-5-5'])
   expect(seen.model).toBe('claude-opus-5-5')
-  expect(seen.sent.at(-1)).toBe('go on')
-  await ui.unmount()
+  expect(seen.sent).toEqual(['go on'])
 })
 
-test('from large to Haiku, compact first runs on Haiku with no more picks', { options: { autoCompact: 'off' } }, async ($, on) => {
-  const seen = await coldSession($, on)
+test('from a large model to Haiku, summarize first runs on Haiku with no more picks', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-opus-5-5', ['Summarize on Haiku first'])
 
   seen.model = 'claude-haiku-5-5'
   await send($, 'go on')
+  for (let i = 0; i < 5 && seen.sent.length < 1; i += 1) await seen.clock.advance(1)
 
-  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
-
-  expect((await buttons(ui)).map(b => b.props.label)).toEqual([expect.stringMatching(/^Continue on Haiku/), expect.stringMatching(/^Compact on Haiku first/), 'Cancel'])
-  await ui.press({ key: 'cold-compact' })
-
+  expect(seen.options[0]).toEqual(['Send on Haiku', 'Summarize on Haiku first', 'Cancel'])
   expect(seen.compactions).toBe(1)
   // Already on Haiku: no switch either way.
   expect(seen.runs).toEqual([])
-  expect(seen.sent.at(-1)).toBe('go on')
-  await ui.unmount()
+  expect(seen.sent).toEqual(['go on'])
 })
 
-test('from Haiku to a larger model, compact first runs on Haiku and sends on the larger one', { options: { autoCompact: 'off' } }, async ($, on) => {
-  const seen = await coldSession($, on, 'claude-haiku-5-5')
+test('from Haiku to a larger model, summarize first runs on Haiku and sends on the larger one', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-haiku-5-5', ['Summarize on Haiku first'])
 
   seen.model = 'claude-opus-5-5'
   await send($, 'go on')
-
-  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
-
-  expect((await buttons(ui)).map(b => b.props.label)).toEqual([expect.stringMatching(/^Continue on Opus/), expect.stringMatching(/^Compact on Haiku first/), 'Cancel'])
-  await ui.press({ key: 'cold-compact' })
+  for (let i = 0; i < 5 && seen.sent.length < 1; i += 1) await seen.clock.advance(1)
 
   expect(seen.compactions).toBe(1)
   expect(seen.runs).toEqual(['model claude-haiku-5-5', 'model claude-opus-5-5'])
-  expect(seen.sent.at(-1)).toBe('go on')
-  await ui.unmount()
+  expect(seen.sent).toEqual(['go on'])
 })
 
-test('from Haiku to Haiku the band offers only continue and cancel', { options: { autoCompact: 'off' } }, async ($, on) => {
-  const seen = await coldSession($, on, 'claude-haiku-5-5')
+test('from Haiku to Haiku the question offers only sending and cancel', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-haiku-5-5', ['Send on Haiku'])
 
   await send($, 'go on')
+  for (let i = 0; i < 5 && seen.sent.length < 1; i += 1) await seen.clock.advance(1)
 
-  const ui = await $.ui.mount({ ...(BAND as object), surface: 'terminal' } as never)
-
-  expect((await buttons(ui)).map(b => b.key)).toEqual(['cold-send', 'cold-cancel'])
-  await ui.press({ key: 'cold-send' })
-  expect(seen.runs).toEqual([])
-  expect(seen.sent.at(-1)).toBe('go on')
-  await ui.unmount()
+  expect(seen.options).toEqual([['Send on Haiku', 'Cancel']])
+  expect(seen.sent).toEqual(['go on'])
 })
 
-test('a Remote Control send asks in the engine box, in steps', { options: { autoCompact: 'off' } }, async ($, on) => {
-  const seen = await coldSession($, on, 'claude-opus-5-5', ['Continue on a lower model', 'Haiku ($0.18)', 'max'])
+test('a Remote Control send asks in the same question box, in steps', { options: { autoCompact: 'off' } }, async ($, on) => {
+  const seen = await coldSession($, on, 'claude-opus-5-5', ['Use a cheaper model', 'Haiku ($0.18)', 'max'])
   const result = await send($, 'from my phone', 'bridge')
 
-  expect(result.drop).toContain('switching to Haiku')
+  expect(result.drop).toContain('Switching to Haiku')
 
-  for (let i = 0; i < 5 && seen.sent.length < 2; i += 1) await seen.clock.advance(1)
+  for (let i = 0; i < 5 && seen.sent.length < 1; i += 1) await seen.clock.advance(1)
 
   expect(seen.asked).toHaveLength(3)
   expect({ runs: seen.runs, logs: seen.logs }).toEqual({ runs: ['model claude-haiku-5-5', 'effort max'], logs: [] })
   expect(seen.sent.at(-1)).toBe('from my phone')
-})
-
-test('the same text sent again while the band asks opens the engine box instead', { options: { autoCompact: 'off' } }, async ($, on) => {
-  const seen = await coldSession($, on, 'claude-opus-5-5', ['Cancel'])
-
-  await send($, 'again')
-  const result = await send($, 'again')
-
-  expect(seen.asked).toHaveLength(1)
-  expect(result.drop).toContain('not sent')
 })
 
 test('a restart keeps the Haiku cache warm when the resume hook runs before session start', async ($, on) => {
@@ -568,11 +513,13 @@ test('a model switched to before sending reads its own cache: cold for Opus here
 
 test('the band names idle compaction, with a timer only when one will fire', () => {
   const opus = 'claude-opus-5-5'
-  const off = parseOptions({})
+  const off = parseOptions({ autoCompact: 'off' })
   const builtin = { ...off, builtin: { minTokens: 200_000, fireAt: 0.9 } }
   const big = { ...warm, tokens: 400_000 }
   const plan = (core: typeof warm, opts: typeof options, ms = 10 * MINUTE) => cacheParts(core, at(ms), opts, opus)?.plan
 
+  // On unless turned off.
+  expect(parseOptions({}).autoCompact).toBe(true)
   expect(off.autoCompact).toBe(false)
   expect(plan(big, off)).toBe('idle compact off')
   expect(plan(big, builtin)).toBe('idle compact in 44m')
@@ -586,6 +533,22 @@ test('the band names idle compaction, with a timer only when one will fire', () 
   expect(plan(warm, parseOptions({ autoCompact: 'on', compactAfter: '30m' }))).toBe('idle compact in 20m')
   expect(plan({ ...warm, keepUntil: at(HOUR) }, options)).toBe('keepwarm 50m')
   expect(parseOptions({ compactAfter: '2h' }).compactAt).toBe(59 * MINUTE)
+})
+
+test('with Claude Code idle compaction on too, the auto timing goes two minutes ahead of it', () => {
+  const builtin = { minTokens: 200_000, fireAt: 0.9 }
+
+  // Claude Code acts at 54m, so cache-seer compacts at 52m and Claude Code finds a small context.
+  expect(aheadOfBuiltin({ ...parseOptions({}), builtin })).toBe(52 * MINUTE)
+  expect(aheadOfBuiltin(parseOptions({}))).toBe(55 * MINUTE)
+  // A set compactAfter, a 5m cache or the fallback off keep their own timing.
+  expect(aheadOfBuiltin({ ...parseOptions({ compactAfter: '55m' }), builtin })).toBe(55 * MINUTE)
+  expect(aheadOfBuiltin({ ...parseOptions({ cacheTtl: '5m' }), builtin })).toBe(4 * MINUTE)
+  expect(aheadOfBuiltin({ ...parseOptions({ autoCompact: 'off' }), builtin })).toBe(55 * MINUTE)
+  // Read again at each start, so it does not creep earlier.
+  const once = { ...parseOptions({}), builtin }
+  once.compactAt = aheadOfBuiltin(once)
+  expect(aheadOfBuiltin(once)).toBe(52 * MINUTE)
 })
 
 test('each compaction line has its own icon state', () => {
@@ -680,8 +643,8 @@ async function start($: any, clock: { advance: (ms: number) => Promise<void> }) 
   await clock.advance(MINUTE)
 }
 
-// The engine's `/cache-keeper` lines, as the person reads them.
-const run = async ($: any, args: string) => (await $.command.run({ command: 'cache-keeper', args })) as { text: string }
+// The engine's `/cache-seer` lines, as the person reads them.
+const run = async ($: any, args: string) => (await $.command.run({ command: 'cache-seer', args })) as { text: string }
 
 test('keep awake is set by command and shown on the status line, for every session', { options: { autoCompact: 'on' } }, async ($, on) => {
   const seen = switchSession($, on)
@@ -715,7 +678,7 @@ test('keep awake is set by command and shown on the status line, for every sessi
   await desktop.unmount()
 
   expect((await run($, 'awake off')).text).toBe('Keep awake is off.')
-  expect((await run($, 'sideways')).text).toBe('Usage: /cache-keeper [compact|awake|motion on|off]')
+  expect((await run($, 'sideways')).text).toBe('Usage: /cache-seer [compact|awake|motion on|off]')
 })
 
 test('motion off by command freezes every drawing', { options: { autoCompact: 'on' } }, async ($, on) => {
@@ -732,4 +695,46 @@ test('motion off by command freezes every drawing', { options: { autoCompact: 'o
   expect((await run($, 'motion on')).text).toBe("The band's animation is on.")
   expect(await frozen()).toEqual([false, false])
   await ui.unmount()
+})
+
+/** An install renamed from cache-keeper: its settings, its store file, and a folder listing for it. */
+function renamedSession($: any, on: any, pluginConfigs: Record<string, unknown>) {
+  const oldStore = '/home/u/.claude/plugins/store/cache-keeper_cache-keeper-5e1f38afcc59.json'
+  const seen = switchSession($, on, {
+    '/home/u/.claude/settings.json': JSON.stringify({ enabledPlugins: { 'cache-keeper@cache-keeper': true }, pluginConfigs }),
+    [oldStore]: JSON.stringify({ prefs: { animate: false } }),
+  })
+
+  on('fs.list', () => ({
+    value: [{ name: 'cache-keeper_cache-keeper-5e1f38afcc59.json', kind: 'file', size: 1, mtimeMs: 0, isLink: false }],
+  }))
+
+  return seen
+}
+
+test('a cache-keeper install carries its options and store over once, and is told to go', async ($, on) => {
+  const seen = renamedSession($, on, { 'cache-keeper@cache-keeper': { options: { guard: 'warn' } } })
+
+  await start($, seen.clock)
+
+  const status = (await run($, '')).text
+
+  expect(status).toContain('guard: warn')
+  expect(status).toContain('motion: off')
+  expect(seen.logs.some(line => line.includes('/plugin uninstall cache-keeper'))).toBe(true)
+
+  // Copied once: a later change is not undone by the old store.
+  await run($, 'motion on')
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect((await run($, '')).text).toContain('motion: on')
+})
+
+test('cache-seer options of its own win over the old ones', async ($, on) => {
+  const seen = renamedSession($, on, {
+    'cache-keeper@cache-keeper': { options: { guard: 'warn' } },
+    'cache-seer@cache-seer': { options: { guard: 'ask' } },
+  })
+
+  await start($, seen.clock)
+  expect((await run($, '')).text).toContain('guard: ask')
 })

@@ -29,6 +29,8 @@ export type Options = {
   minTokens: number
   /** Idle time before the one auto compact: shortly before the cache goes cold, or the compactAfter duration. */
   compactAt: number
+  /** compactAfter is auto, so the timing may move ahead of Claude Code's own idle compaction. */
+  autoTiming: boolean
   /** Claude Code's own idle compaction, as read at session start; null where it is off. */
   builtin: Builtin | null
 }
@@ -43,13 +45,14 @@ export function parseOptions(raw: Readonly<Record<string, unknown>>): Options {
   const after = typeof raw.compactAfter === 'string' && raw.compactAfter !== 'auto' ? parseDuration(raw.compactAfter) : null
 
   return {
-    // The fallback is off unless asked for: compaction replaces detail with a summary.
-    autoCompact: raw.autoCompact === 'on',
+    // On unless turned off: a compaction while the cache is warm is what makes coming back cheap.
+    autoCompact: raw.autoCompact !== 'off',
     keepAwake: raw.keepAwake === 'on',
     guard: raw.guard === 'warn' || raw.guard === 'off' ? raw.guard : 'ask',
     ttlMs,
     // A compaction must start while the cache still serves it, so a longer setting is held a minute short of cold.
     compactAt: after === null ? compactAtMs(ttlMs) : Math.min(after, ttlMs - MINUTE),
+    autoTiming: after === null,
     builtin: null,
     minTokens: Number.isFinite(minTokens) && minTokens > 0 ? minTokens : 50_000,
   }
@@ -57,6 +60,20 @@ export function parseOptions(raw: Readonly<Record<string, unknown>>): Options {
 
 /** Compact 5 minutes before a 1h cache goes cold, 1 minute before a 5m one. */
 export const compactAtMs = (ttlMs: number) => ttlMs - Math.max(MINUTE, Math.min(5 * MINUTE, ttlMs / 5))
+
+/**
+ * With Claude Code's own idle compaction on as well, an auto timing goes two minutes ahead of it, so
+ * the fallback compacts first and Claude Code's later run finds a small context instead of writing a
+ * second summary. A compactAfter that was set is kept as set.
+ */
+export function aheadOfBuiltin(options: Options): number {
+  const base = options.autoTiming ? compactAtMs(options.ttlMs) : options.compactAt
+  const { builtin } = options
+
+  if (!options.autoCompact || !options.autoTiming || !builtin || options.ttlMs !== HOUR) return base
+
+  return Math.min(base, builtin.fireAt * HOUR - 2 * MINUTE)
+}
 
 /** Ping well ahead of the compact point, so a keepwarm window ending hands over cleanly. */
 export const pingEveryMs = (ttlMs: number) => Math.round((ttlMs * 5) / 6) - MINUTE
@@ -231,7 +248,7 @@ export function span(ms: number): string {
 }
 
 const RATE_NAMES: Readonly<Record<string, string>> = { seven_day: '7D', five_hour: '5H', spend_limit: 'SPEND' }
-const RATE_ORDER = ['seven_day', 'five_hour', 'spend_limit']
+const RATE_ORDER = ['five_hour', 'seven_day', 'spend_limit']
 const LOW_AT = 15
 
 export type Tone = 'ok' | 'watch' | 'high' | 'critical'
@@ -294,7 +311,7 @@ const rankOf = (model: string) => {
 }
 const isHaiku = (model: string) => shortName(model) === 'Haiku'
 
-/** Which of the four cold-send dialogs applies: the last reply's model, then the model about to send. */
+/** Which of the four cold-send questions applies: the last reply's model, then the model about to send. */
 export type ColdCase = 'large-large' | 'large-haiku' | 'haiku-large' | 'haiku-haiku'
 
 export function coldCase(lastModel: string, selected: string): ColdCase {
@@ -304,8 +321,8 @@ export function coldCase(lastModel: string, selected: string): ColdCase {
 }
 
 /**
- * What the cold-send dialog offers. `send` re-writes the whole cache at full price (red); `switch`
- * and `compact` cost less (yellow); `cancel` keeps the text.
+ * What the cold-send question offers. `send` re-writes the whole cache at full price; `switch`
+ * and `compact` cost less; `cancel` keeps the text.
  */
 export type ColdChoice = 'send' | 'switch' | 'compact' | 'cancel'
 
@@ -314,14 +331,6 @@ export function coldChoices(kind: ColdCase, selected: string): ColdChoice[] {
   if (kind === 'large-large' && lowerModels(selected).length > 0) return ['send', 'switch', 'compact', 'cancel']
 
   return ['send', 'compact', 'cancel']
-}
-
-/** The theme color of each choice: red for the full re-write, yellow for the cheaper roads, none for cancel. */
-export const CHOICE_HUE: Readonly<Record<ColdChoice, 'error' | 'warning' | undefined>> = {
-  send: 'error',
-  switch: 'warning',
-  compact: 'warning',
-  cancel: undefined,
 }
 
 /** The models below this one, the next one down first: what "continue on a lower model" offers. */
@@ -384,7 +393,7 @@ export function coldState(core: Core, model: string, now: number, options: Optio
 }
 
 /**
- * Idle compaction, always named so the feature is never a surprise: cache-keeper's fallback where
+ * Idle compaction, always named so the feature is never a surprise: cache-seer's own where
  * it is on, else Claude Code's own, else off. A timer shows only when one will fire this idle.
  */
 export function compactStatus(core: Core, now: number, options: Options, isWarm: boolean): string {
@@ -470,7 +479,7 @@ export function cacheParts(core: Core, now: number, options: Options, model: str
   return { mode: 'warm', time: left, cost, plan, planState: planStateOf(plan), lead, summary: `${lead} ${plan}.` }
 }
 
-/** The cache line for `/cache-keeper` and the terminal band. */
+/** The cache line for `/cache-seer` and the terminal band. */
 export function cacheText(core: Core, now: number, options: Options, model: string): string | null {
   return cacheParts(core, now, options, model)?.summary ?? null
 }

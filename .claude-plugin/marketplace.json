@@ -1,5 +1,5 @@
 {
-  "name": "cache-keeper",
+  "name": "cache-seer",
   "owner": { "name": "izanorshahril" },
-  "plugins": [{ "name": "cache-keeper", "source": "./" }]
+  "plugins": [{ "name": "cache-seer", "source": "./" }]
 }

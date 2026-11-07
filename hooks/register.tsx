@@ -1,14 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ColdAsk, Core, RateRow } from '../types'
+import type { Core, RateRow } from '../types'
 import { BG, MODE_HUE, MUTED, PLAN_GLYPH, PLAN_HUE, TONE, mascotSvg, statusSvg, usageSvg } from './art'
-import type { ColdChoice, Effort, Options, PlanState } from './logic'
+import type { ColdCase, ColdChoice, Effort, Options, PlanState } from './logic'
 import {
-  CHOICE_HUE,
   DEFAULT_KEEP_MS,
-  EFFORTS,
   EMPTY,
+  aheadOfBuiltin,
   HOUR,
   MINUTE,
   cacheParts,
@@ -41,9 +40,8 @@ import {
   wantsAwake,
 } from './logic'
 
-const core = atom({ plugin: 'cache-keeper', key: 'core' } as const, EMPTY)
-const rate = atom({ plugin: 'cache-keeper', key: 'rate' } as const, [] as RateRow[])
-const ask = atom({ plugin: 'cache-keeper', key: 'ask' } as const, null as ColdAsk | null)
+const core = atom({ plugin: 'cache-seer', key: 'core' } as const, EMPTY)
+const rate = atom({ plugin: 'cache-seer', key: 'rate' } as const, [] as RateRow[])
 
 const TICK_MS = 30_000
 const COMPACT_RETRY_MS = 2 * MINUTE
@@ -148,15 +146,72 @@ async function readJson($: EngineInterface, file: string): Promise<unknown> {
   }
 }
 
-// Only what decides Claude Code's own idle compaction is read from its config and settings; nothing is kept.
-async function readBuiltin($: EngineInterface) {
+/** Claude Code's settings folder, and its .claude.json, which CLAUDE_CONFIG_DIR moves into that folder. */
+async function claudePaths($: EngineInterface): Promise<{ dir?: string; configFile?: string }> {
   const configDir = await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)
   const home = (await $.env.get('HOME').catch(() => undefined)) ?? (await $.env.get('USERPROFILE').catch(() => undefined))
-  // With CLAUDE_CONFIG_DIR set, .claude.json lives in it; otherwise in the home folder, beside .claude.
-  const configFile = configDir ? `${configDir}/.claude.json` : home ? `${home}/.claude.json` : undefined
-  const settingsFile = configDir ? `${configDir}/settings.json` : home ? `${home}/.claude/settings.json` : undefined
+
+  if (configDir) return { dir: configDir, configFile: `${configDir}/.claude.json` }
+
+  return home ? { dir: `${home}/.claude`, configFile: `${home}/.claude.json` } : {}
+}
+
+/** The mod's name before the rename; its saved state and options carry over once. */
+const OLD_NAME = 'cache-keeper'
+const MIGRATED_KEY = 'migrated'
+
+function pluginEntry(table: unknown, name: string): unknown {
+  if (!table || typeof table !== 'object') return undefined
+
+  const key = Object.keys(table).find(id => id.startsWith(`${name}@`))
+
+  return key ? (table as Record<string, unknown>)[key] : undefined
+}
+
+/**
+ * Carries a cache-keeper install over to cache-seer: its store once (session cache times, saved usage,
+ * keep awake and motion), and its options while cache-seer has none of its own. Warns while it is still on.
+ */
+async function adoptOld($: EngineInterface, options: Options): Promise<void> {
+  const { dir } = await claudePaths($)
+
+  if (!dir) return
+
+  const settings = (await readJson($, `${dir}/settings.json`)) as Record<string, unknown> | null
+  const oldConfig = pluginEntry(settings?.pluginConfigs, OLD_NAME) as { options?: Record<string, unknown> } | undefined
+
+  if (oldConfig?.options && pluginEntry(settings?.pluginConfigs, 'cache-seer') === undefined) {
+    const { builtin, ...adopted } = parseOptions(oldConfig.options)
+
+    Object.assign(options, adopted)
+    baseKeepAwake = options.keepAwake
+  }
+
+  if (pluginEntry(settings?.enabledPlugins, OLD_NAME) === true) {
+    $.ui.log(`cache-seer: ${OLD_NAME}, its old name, is still on, so the band and guard run twice. Run /plugin uninstall ${OLD_NAME}.`)
+  }
+
+  if (await $.store.get(MIGRATED_KEY).catch(() => true)) return
+
+  // Marked first, so a failed copy is never retried at every start.
+  await $.store.set(MIGRATED_KEY, true)
+
+  const stores = await $.fs.list(`${dir}/plugins/store`).catch(() => [])
+  const old = stores.find(entry => entry.kind === 'file' && entry.name.startsWith(`${OLD_NAME}_${OLD_NAME}-`) && entry.name.endsWith('.json'))
+  const saved = old ? await readJson($, `${dir}/plugins/store/${old.name}`) : null
+
+  if (!saved || typeof saved !== 'object') return
+
+  for (const [key, value] of Object.entries(saved)) {
+    if ((await $.store.get(key)) === undefined) await $.store.set(key, value)
+  }
+}
+
+// Only what decides Claude Code's own idle compaction is read from its config and settings; nothing is kept.
+async function readBuiltin($: EngineInterface) {
+  const { dir, configFile } = await claudePaths($)
   const config = configFile ? await readJson($, configFile) : null
-  const settings = settingsFile ? await readJson($, settingsFile) : null
+  const settings = dir ? await readJson($, `${dir}/settings.json`) : null
 
   return builtinIdle(config, settings, await $.env.get('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS').catch(() => undefined))
 }
@@ -173,14 +228,14 @@ async function runCompact($: EngineInterface, idleMs: number, now: number): Prom
 
         if (result.skip !== undefined) {
           nextCompactAt = now + COMPACT_RETRY_MS
-          $.ui.log(`cache-keeper: auto compact skipped after ${span(idleMs)} idle: ${result.skip}. Trying again in 2m.`)
+          $.ui.log(`cache-seer: auto compact skipped after ${span(idleMs)} idle: ${result.skip}. Trying again in 2m.`)
           return
         }
 
         const after = result.tokensAfter ?? 0
 
         await patch($, c => ({ ...c, compacted: true, compactTried: true, tokens: after > 0 ? after : c.tokens }))
-        $.ui.log(`cache-keeper: compacted ${tok(before)} to ${tok(after)} after ${span(idleMs)} idle, before the cache went cold.`)
+        $.ui.log(`cache-seer: compacted ${tok(before)} to ${tok(after)} after ${span(idleMs)} idle, before the cache went cold.`)
         return
       } catch (error) {
         if (!isHeadlessRefusal(error)) throw error
@@ -192,10 +247,10 @@ async function runCompact($: EngineInterface, idleMs: number, now: number): Prom
     await $.command.run({ command: 'compact', args: '' })
     // The engine may not report the size after a /compact turn, so the last figure stays until the next reply.
     await patch($, c => ({ ...c, compacted: true, compactTried: true }))
-    $.ui.log(`cache-keeper: compacted with /compact after ${span(idleMs)} idle, before the cache went cold.`)
+    $.ui.log(`cache-seer: compacted with /compact after ${span(idleMs)} idle, before the cache went cold.`)
   } catch (error) {
     nextCompactAt = now + COMPACT_RETRY_MS
-    $.ui.log(`cache-keeper: auto compact failed after ${span(idleMs)} idle: ${String(error)}. Trying again in 2m.`)
+    $.ui.log(`cache-seer: auto compact failed after ${span(idleMs)} idle: ${String(error)}. Trying again in 2m.`)
   } finally {
     isCompacting = false
   }
@@ -213,7 +268,7 @@ async function runPing($: EngineInterface, now: number): Promise<void> {
       await patch($, c => ({ ...c, lastAt: now }))
     } else {
       await patch($, c => ({ ...c, keepUntil: 0 }))
-      $.ui.log(`cache-keeper: keepwarm stopped: the ping read ${tok(readTokens)} and wrote ${tok(written)}, so the cache was already gone.`)
+      $.ui.log(`cache-seer: keepwarm stopped: the ping read ${tok(readTokens)} and wrote ${tok(written)}, so the cache was already gone.`)
     }
 
     return
@@ -229,16 +284,16 @@ async function runPing($: EngineInterface, now: number): Promise<void> {
   }
 
   await patch($, c => ({ ...c, keepUntil: 0 }))
-  $.ui.log(`cache-keeper: keepwarm stopped: ${reply.reason}.`)
+  $.ui.log(`cache-seer: keepwarm stopped: ${reply.reason}.`)
 }
 
-/** Keep awake and motion as `/cache-keeper` set them, kept across sessions; unset follows the plugin option. */
+/** Keep awake and motion as `/cache-seer` set them, kept across sessions; unset follows the plugin option. */
 type Prefs = { keepAwake?: boolean; animate?: boolean }
 
 const PREFS_KEY = 'prefs'
 // The plugin option as set, before a command overrides it.
 let baseKeepAwake = false
-// The drawings animate unless `/cache-keeper motion off` said otherwise.
+// The drawings animate unless `/cache-seer motion off` said otherwise.
 let animate = true
 
 /** Reads what any session saved, so every session follows the last command. */
@@ -276,7 +331,7 @@ async function holdCommands($: EngineInterface): Promise<string[][]> {
     ]
   }
 
-  return [['caffeinate', '-i'], ['systemd-inhibit', '--what=idle:sleep', '--who=cache-keeper', '--why=idle compaction', 'sleep', 'infinity']]
+  return [['caffeinate', '-i'], ['systemd-inhibit', '--what=idle:sleep', '--who=cache-seer', '--why=idle compaction', 'sleep', 'infinity']]
 }
 
 /** Starts the first helper that runs on this system; one that cannot start or ends by itself gives way to the next. */
@@ -301,7 +356,7 @@ function holdAwake($: EngineInterface): { stop: () => void } {
     }
 
     awake = null
-    $.ui.log('cache-keeper: keep awake found no helper to run on this system (pwsh, powershell, caffeinate or systemd-inhibit).')
+    $.ui.log('cache-seer: keep awake found no helper to run on this system (pwsh, powershell, caffeinate or systemd-inhibit).')
   })()
 
   return {
@@ -363,51 +418,42 @@ async function tick($: EngineInterface, options: Options): Promise<void> {
 }
 
 // Puts the text back in the box where the surface has one; otherwise the notice carries it.
-async function keepText($: EngineInterface, text: string, why: string) {
+/** Puts the text back in the box; the card says why, and where the text went. */
+async function restore($: EngineInterface, text: string, why: string) {
   const isRestored = await $.prompt.fill({ text }).then(
     filled => filled.isFilled,
     () => false,
   )
 
-  return {
-    drop: isRestored ? `cache-keeper: ${why}, your text is back in the box.` : `cache-keeper: ${why}. Your text: ${text.slice(0, 3500)}`,
-  }
+  return { drop: isRestored ? `${why} Your message is back in the box.` : `${why} Your message: ${text.slice(0, 3500)}` }
 }
 
-/** What a cold-send pick comes to: send as is, send on a lower model, or compact first and send on the model chosen. */
+/** What the question came to: send as is, or first switch or summarize on a model, then send. */
 type Plan =
   | { road: 'send' }
-  | { road: 'switch'; model: string; effort?: Effort }
+  | { road: 'switch'; model: string; effort: Effort }
   | { road: 'compact'; model: string; effort?: Effort; back: string }
 
-/** The words of each choice, with the price of the road where it has one. */
-function choiceLabel(choice: ColdChoice, held: ColdAsk, value: Core, now: number, options: Options): string {
-  const quote = (model: string) => {
-    const cost = nextCost(value, model, now, options)
+/** What the question is about: the model the message goes on, and its cache's state. */
+type Held = { kind: ColdCase; selected: string; coldFor: string }
 
-    return cost ? ` (${usd(cost.usd)})` : ''
-  }
-
-  if (choice === 'send') return `Continue on ${shortName(held.selected)}${quote(held.selected)}`
-  if (choice === 'switch') return 'Continue on a lower model'
+/** The option labels: short, with the cost kept to the question and the model list. */
+function choiceLabel(choice: ColdChoice, held: Held): string {
+  if (choice === 'send') return `Send on ${shortName(held.selected)}`
+  if (choice === 'switch') return 'Use a cheaper model'
   if (choice === 'cancel') return 'Cancel'
 
   const [only] = compactModels(held.kind, held.selected)
 
-  return picksCompactModel(held.kind) || !only ? 'Compact first' : `Compact on ${shortName(only)} first${quote(only)}`
+  return picksCompactModel(held.kind) || !only ? 'Summarize first' : `Summarize on ${shortName(only)} first`
 }
-
-/** The models the `model` step offers for the road picked. */
-const modelsFor = (held: ColdAsk) => (held.road === 'switch' ? lowerModels(held.selected) : compactModels(held.kind, held.selected))
-
-const setModel = ($: EngineInterface, model: string) => $.command.run({ command: 'model', args: model })
 
 /** Sets the effort with `/effort`; a failure is logged and the send goes on at the effort in force. */
 async function setEffort($: EngineInterface, effort: string): Promise<void> {
   try {
     await $.command.run({ command: 'effort', args: effort })
   } catch (error) {
-    $.ui.log(`cache-keeper: could not set effort ${effort}: ${String(error)}`)
+    $.ui.log(`cache-seer: could not set effort ${effort}: ${String(error)}`)
   }
 }
 
@@ -427,27 +473,26 @@ async function compactNow($: EngineInterface): Promise<{ skip?: string; tokensAf
 }
 
 /**
- * Carries out a cold-send pick, then sends the message as typed. The text is read back from the
- * box, where the guard put it, so an edit made meanwhile is what goes; nothing is sent on a failure.
+ * Carries out a plan, then sends the message as typed. The text is read back from the box, where
+ * the guard put it, so an edit made meanwhile is what goes; nothing is sent on a failure.
  */
 async function perform($: EngineInterface, plan: Plan, held: string): Promise<void> {
   const fail = async (why: string) => {
-    await update($, ask, () => null)
     const restored = await $.prompt.fill({ text: held }).then(
       filled => filled.isFilled,
       () => false,
     )
-    $.ui.log(`cache-keeper: ${why}, so nothing was sent.${restored ? ' Your text is in the box.' : ` Your text: ${held.slice(0, 3500)}`}`)
+    $.ui.log(`cache-seer: ${why}, so nothing was sent.${restored ? ' Your text is in the box.' : ` Your text: ${held.slice(0, 3500)}`}`)
   }
 
   if (plan.road === 'switch') {
     try {
-      await setModel($, plan.model)
+      await $.command.run({ command: 'model', args: plan.model })
     } catch (error) {
       return fail(`the switch to ${shortName(plan.model)} failed: ${String(error)}`)
     }
 
-    if (plan.effort) await setEffort($, plan.effort)
+    await setEffort($, plan.effort)
   }
 
   if (plan.road === 'compact') {
@@ -455,11 +500,10 @@ async function perform($: EngineInterface, plan: Plan, held: string): Promise<vo
     const effortBefore = lastEffort
     const before = (await read($, core)).tokens
 
-    await update($, ask, held => (held ? { ...held, step: 'working' } : held))
     isCompacting = true
 
     try {
-      if (moves) await setModel($, plan.model)
+      if (moves) await $.command.run({ command: 'model', args: plan.model })
       if (plan.effort) await setEffort($, plan.effort)
 
       const result = await compactNow($)
@@ -469,18 +513,16 @@ async function perform($: EngineInterface, plan: Plan, held: string): Promise<vo
       const after = result.tokensAfter ?? 0
 
       await patch($, c => ({ ...c, compacted: true, compactTried: true, tokens: after > 0 ? after : c.tokens }))
-      $.ui.log(`cache-keeper: compacted ${tok(before)}${after > 0 ? ` to ${tok(after)}` : ''} on ${shortName(plan.model)} before sending.`)
+      $.ui.log(`cache-seer: compacted ${tok(before)}${after > 0 ? ` to ${tok(after)}` : ''} on ${shortName(plan.model)} before sending.`)
     } catch (error) {
       return fail(`the compaction on ${shortName(plan.model)} failed: ${String(error)}`)
     } finally {
       isCompacting = false
       // The message goes out on the model and effort it was typed for.
-      if (moves) await setModel($, plan.back).catch(error => $.ui.log(`cache-keeper: could not switch back to ${shortName(plan.back)}: ${String(error)}`))
+      if (moves) await $.command.run({ command: 'model', args: plan.back }).catch(error => $.ui.log(`cache-seer: could not switch back to ${shortName(plan.back)}: ${String(error)}`))
       if (plan.effort && effortBefore && effortBefore !== plan.effort) await setEffort($, effortBefore)
     }
   }
-
-  await update($, ask, () => null)
 
   const typed = await $.prompt.read().then(
     box => box.text,
@@ -491,59 +533,22 @@ async function perform($: EngineInterface, plan: Plan, held: string): Promise<vo
   if (typed !== '') await $.prompt.fill({ text: '' }).catch(() => undefined)
 
   // Not awaited: the call resolves only when its turn starts.
-  void $.prompt.submit({ text }).catch(error => $.ui.log(`cache-keeper: re-send failed: ${String(error)}`))
-}
-
-/** A band press on the cold-send dialog: the next step, or the plan once nothing is left to pick. */
-async function pressChoice($: EngineInterface, choice: ColdChoice | 'model' | 'effort', pick?: string): Promise<void> {
-  const held = await read($, ask)
-
-  if (!held || held.step === 'working') return
-
-  if (choice === 'cancel') {
-    await update($, ask, () => null)
-    return
-  }
-
-  if (choice === 'send') return perform($, { road: 'send' }, held.text)
-
-  if (choice === 'switch' || choice === 'compact') {
-    if (choice === 'compact' && !picksCompactModel(held.kind)) {
-      const [model] = compactModels(held.kind, held.selected)
-
-      return perform($, { road: 'compact', model: model ?? held.selected, back: held.selected }, held.text)
-    }
-
-    await update($, ask, () => ({ ...held, step: 'model', road: choice }))
-    return
-  }
-
-  if (choice === 'model' && pick) {
-    await update($, ask, () => ({ ...held, step: 'effort', model: pick }))
-    return
-  }
-
-  if (choice === 'effort' && pick && isEffort(pick) && held.model) {
-    const plan: Plan =
-      held.road === 'switch'
-        ? { road: 'switch', model: held.model, effort: pick }
-        : { road: 'compact', model: held.model, effort: pick, back: held.selected }
-
-    return perform($, plan, held.text)
-  }
+  void $.prompt.submit({ text }).catch(error => $.ui.log(`cache-seer: re-send failed: ${String(error)}`))
 }
 
 /**
- * The same dialog in the engine's own question box, which reaches every surface (Remote Control
- * and SDK hosts too) but draws no colors. Null for a cancel; throws when it cannot be shown.
+ * The one question a cold send asks, in the engine's own question box, which reaches every surface
+ * (Remote Control and SDK hosts too). A road that needs a model asks which; a switch or a summary
+ * that needs one asks its effort too. Null for a cancel; throws when the box cannot be shown.
  */
-async function askInSteps($: EngineInterface, held: ColdAsk, value: Core, now: number, options: Options): Promise<Plan | null> {
+async function askCold($: EngineInterface, held: Held, value: Core, now: number, options: Options): Promise<Plan | null> {
   const choices = coldChoices(held.kind, held.selected)
-  const labels = choices.map(choice => choiceLabel(choice, held, value, now, options))
-  const answer = await $.ui.ask(
-    `The ${shortName(held.selected)} prompt cache ${held.coldFor}. This message re-writes ${tok(held.tokens)} tokens. How should it go?`,
-    { header: 'Cold cache', options: labels },
-  )
+  const labels = choices.map(choice => choiceLabel(choice, held))
+  const cost = nextCost(value, held.selected, now, options)
+  const answer = await $.ui.ask(`${shortName(held.selected)} ${held.coldFor}. Sending rebuilds this conversation${cost ? `, about ${usd(cost.usd)}` : ''}.`, {
+    header: 'Cold cache',
+    options: labels,
+  })
   const choice = choices[labels.indexOf(answer)]
 
   if (!choice || choice === 'cancel') return null
@@ -555,13 +560,13 @@ async function askInSteps($: EngineInterface, held: ColdAsk, value: Core, now: n
     return { road: 'compact', model: model ?? held.selected, back: held.selected }
   }
 
-  const models = modelsFor({ ...held, road: choice })
+  const models = choice === 'switch' ? lowerModels(held.selected) : compactModels(held.kind, held.selected)
   const modelLabels = models.map(model => {
-    const cost = nextCost(value, model, now, options)
+    const modelCost = nextCost(value, model, now, options)
 
-    return `${shortName(model)}${cost ? ` (${usd(cost.usd)})` : ''}`
+    return `${shortName(model)}${modelCost ? ` (${usd(modelCost.usd)})` : ''}`
   })
-  const pickedModel = models[modelLabels.indexOf(await $.ui.ask(choice === 'switch' ? 'Continue on which model?' : 'Compact on which model?', { header: 'Model', options: modelLabels }))]
+  const pickedModel = models[modelLabels.indexOf(await $.ui.ask(choice === 'switch' ? 'Send on which model?' : 'Summarize on which model?', { header: 'Model', options: modelLabels }))]
 
   if (!pickedModel) return null
 
@@ -575,68 +580,6 @@ async function askInSteps($: EngineInterface, held: ColdAsk, value: Core, now: n
     : { road: 'compact', model: pickedModel, effort, back: held.selected }
 }
 
-/** The cold-send dialog as band rows: a line of what it costs, then one colored button per choice. */
-function coldDialog($: EngineInterface, ui: ReturnType<EngineInterface['ui']['resolve']>, held: ColdAsk, value: Core, now: number, options: Options) {
-  const { Box, Button, Text } = ui
-  const label = shortName(held.selected)
-  type Row = { key: string; label: string; hue: string | undefined; press: () => Promise<void> }
-  let question: string
-  let rows: Row[]
-
-  if (held.step === 'working') {
-    question = `Compacting on ${shortName(held.model ?? compactModels(held.kind, held.selected)[0] ?? held.selected)}, then sending on ${label}...`
-    rows = []
-  } else if (held.step === 'model') {
-    question = held.road === 'switch' ? 'Continue on which model?' : 'Compact on which model?'
-    rows = modelsFor(held).map(model => {
-      const cost = nextCost(value, model, now, options)
-
-      return {
-        key: `cold-model-${familyKey(model)}`,
-        label: `${shortName(model)}${cost ? ` (${usd(cost.usd)})` : ''}`,
-        hue: CHOICE_HUE.compact,
-        press: () => pressChoice($, 'model', model),
-      }
-    })
-  } else if (held.step === 'effort') {
-    question = `${held.road === 'switch' ? 'Continue' : 'Compact'} on ${shortName(held.model ?? '')} at which effort?`
-    rows = EFFORTS.map(effort => ({ key: `cold-effort-${effort}`, label: effort, hue: CHOICE_HUE.compact, press: () => pressChoice($, 'effort', effort) }))
-  } else {
-    question = `The ${label} cache ${held.coldFor}. This message re-writes ${tok(held.tokens)} tokens.`
-    rows = coldChoices(held.kind, held.selected).map(choice => ({
-      key: `cold-${choice}`,
-      label: choiceLabel(choice, held, value, now, options),
-      hue: CHOICE_HUE[choice],
-      press: () => pressChoice($, choice),
-    }))
-  }
-
-  if (held.step !== 'choose' && held.step !== 'working') {
-    rows.push({ key: 'cold-cancel', label: 'Cancel', hue: CHOICE_HUE.cancel, press: () => pressChoice($, 'cancel') })
-  }
-
-  const onPress = (press: () => Promise<void>) => () => {
-    void press().catch(error => $.ui.log(`cache-keeper: ${String(error)}`))
-  }
-
-  return (
-    <Box key="cold" flexDirection="column" marginBottom={1}>
-      <Text color="warning" bold>
-        {question}
-      </Text>
-      <Box flexDirection="row" flexWrap="wrap">
-        {rows.map((row, at) => (
-          <Box key={`${row.key}-box`} marginRight={2}>
-            <Button key={row.key} label={row.label} hotkey={String(at + 1)} onPress={onPress(row.press)}>
-              {row.hue ? <Text color={row.hue}>{row.label}</Text> : row.label}
-            </Button>
-          </Box>
-        ))}
-      </Box>
-    </Box>
-  )
-}
-
 export const register: Register = (on, rawOptions) => {
   const options = parseOptions(rawOptions as Readonly<Record<string, unknown>>)
 
@@ -644,10 +587,12 @@ export const register: Register = (on, rawOptions) => {
 
   on('session.start', async ($, e, next) => {
     viaCommand = !e.isInteractive
+    await adoptOld($, options)
     options.builtin = await readBuiltin($)
+    options.compactAt = aheadOfBuiltin(options)
     await loadPrefs($, options)
     await $.command.register({
-      name: 'cache-keeper',
+      name: 'cache-seer',
       description: 'Shows the prompt cache state; "compact", "awake" or "motion" with on or off sets idle compaction for this session, keep awake, or the band animation.',
       argumentHint: '[compact|awake|motion on|off]',
     })
@@ -725,9 +670,8 @@ export const register: Register = (on, rawOptions) => {
   on('turn.start', async ($, e, next) => {
     if (!e.agentId && !isCompacting) {
       isTurnRunning = true
-      // A real turn adds context, so a later idle may compact again; a dialog it went past is moot.
+      // A real turn adds context, so a later idle may compact again.
       await patch($, c => ({ ...c, compacted: false, compactTried: false }))
-      if (await read($, ask)) await update($, ask, () => null)
     }
 
     return next(e)
@@ -798,51 +742,33 @@ export const register: Register = (on, rawOptions) => {
     const price = nextCost(value, selected, now, options)
     const cost = price ? usd(price.usd) : null
     const coldFor = coldState(value, selected, now, options)
-    const notice = `cache-keeper: the ${label} cache ${coldFor}; this message re-writes ${tok(value.tokens)} tokens${cost ? `, about ${cost}` : ''}.`
+    const notice = `cache-seer: the ${label} cache ${coldFor}; this message re-writes ${tok(value.tokens)} tokens${cost ? `, about ${cost}` : ''}.`
 
     if (options.guard === 'warn') {
       $.ui.log(notice)
       return next(e)
     }
 
-    const held: ColdAsk = {
-      text: e.text,
-      kind: coldCase(value.replyModel || value.model || selected, selected),
-      selected,
-      coldFor,
-      tokens: value.tokens,
-      step: 'choose',
-    }
-    const waiting = await read($, ask)
-
-    // At the composer the band asks, in color. The same text sent again while it asks means the
-    // band is not in view, so the engine's question box asks instead.
-    if (e.origin.kind === 'composer' && !e.attachments?.length && waiting?.text !== e.text) {
-      await update($, ask, () => held)
-      return keepText($, e.text, `the ${label} cache ${coldFor}; pick how to send it above the prompt`)
-    }
-
-    await update($, ask, () => null)
-
+    const held: Held = { kind: coldCase(value.replyModel || value.model || selected, selected), selected, coldFor }
     let plan: Plan | null
 
     try {
       // A message with attachments is sent or kept: they do not survive a re-send.
       plan = e.attachments?.length
-        ? (await $.ui.ask(`The ${label} prompt cache ${coldFor}. This message re-writes ${tok(value.tokens)} tokens. Send it?`, {
+        ? (await $.ui.ask(`${label} ${coldFor}. Sending rebuilds this conversation${cost ? `, about ${cost}` : ''}.`, {
             header: 'Cold cache',
-            options: [`Continue on ${label}${cost ? ` (${cost})` : ''}`, 'Cancel'],
+            options: [`Send on ${label}`, 'Cancel'],
           })) === 'Cancel'
           ? null
           : { road: 'send' }
-        : await askInSteps($, held, value, now, options)
+        : await askCold($, held, value, now, options)
     } catch {
-      // A dialog that could not be shown must never eat a prompt.
+      // A question that could not be shown must never eat a prompt.
       $.ui.log(notice)
       return next(e)
     }
 
-    if (!plan) return keepText($, e.text, 'not sent')
+    if (!plan) return restore($, e.text, 'Not sent.')
     if (plan.road === 'send') return next(e)
 
     // Run from a timer, once this prompt has ended: the engine refuses a command run from this hook,
@@ -850,20 +776,23 @@ export const register: Register = (on, rawOptions) => {
     const queued = plan
 
     $.clock.after(0, () => {
-      void perform($, queued, e.text).catch(error => $.ui.log(`cache-keeper: ${String(error)}`))
+      void perform($, queued, e.text).catch(error => $.ui.log(`cache-seer: ${String(error)}`))
     })
 
     return {
-      drop: `cache-keeper: ${plan.road === 'switch' ? `switching to ${shortName(plan.model)}` : `compacting on ${shortName(plan.model)} first`}, then sending your message.`,
+      drop:
+        plan.road === 'switch'
+          ? `Switching to ${shortName(plan.model)}, then sending your message.`
+          : `Summarizing with ${shortName(plan.model)}, then sending your message${plan.back && familyKey(plan.back) !== familyKey(plan.model) ? ` on ${shortName(plan.back)}` : ''}.`,
     }
   })
 
-  on('command.run', { command: 'cache-keeper' }, async ($, e) => {
+  on('command.run', { command: 'cache-seer' }, async ($, e) => {
     const arg = e.args.trim()
 
     if (arg === 'compact on' || arg === 'compact off') {
       await patch($, c => ({ ...c, noCompact: arg === 'compact off' }))
-      return { text: `cache-keeper's idle compaction is ${arg === 'compact off' ? 'off' : 'on'} for this session.` }
+      return { text: `cache-seer's idle compaction is ${arg === 'compact off' ? 'off' : 'on'} for this session.` }
     }
 
     // Kept for every session, as the band shows them.
@@ -877,7 +806,7 @@ export const register: Register = (on, rawOptions) => {
       return { text: `The band's animation is ${arg === 'motion on' ? 'on' : 'off'}.` }
     }
 
-    if (arg !== '') return { text: 'Usage: /cache-keeper [compact|awake|motion on|off]' }
+    if (arg !== '') return { text: 'Usage: /cache-seer [compact|awake|motion on|off]' }
 
     const now = await $.clock.now()
     const value = await read($, core)
@@ -890,7 +819,7 @@ export const register: Register = (on, rawOptions) => {
       .map(est => `${est.label} ${usd(est.usd)} (${est.warm ? 'read' : 'write'})`)
       .join(', ')
     const autoCompact = options.autoCompact && !value.noCompact
-      ? `cache-keeper, after ${span(options.compactAt)} idle`
+      ? `cache-seer, after ${span(options.compactAt)} idle`
       : options.builtin
         ? `Claude Code's idle compaction, at ${span(options.builtin.fireAt * HOUR)} idle on ${tok(options.builtin.minTokens)}+ tokens`
         : 'off'
@@ -938,9 +867,7 @@ export const register: Register = (on, rawOptions) => {
     const rows = await read($, rate)
     const selected = resolveModel(await $.session.model(), value)
     const cache = cacheParts({ ...value, armed: armedHere }, now, options, selected)
-    const held = await read($, ask)
-
-    if (!cache && rows.length === 0 && !held) return next(e)
+    if (!cache && rows.length === 0) return next(e)
 
     const parts = rateParts(rows, now)
     const columns = e.props.bodyColumns ?? e.viewport?.columns ?? 100
@@ -948,13 +875,11 @@ export const register: Register = (on, rawOptions) => {
     const { Box, Text } = ui
     // The terminal's table lists Svg too, so ask the surface.
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : null
-    const dialog = held ? coldDialog($, ui, held, value, now, options) : null
     const awakeText = `keep awake ${options.keepAwake ? 'on' : 'off'}`
 
     if (!Svg) {
       return (
         <Box flexDirection="column">
-          {dialog}
           {parts.length > 0 ? (
             <Box flexDirection="row" flexWrap="wrap">
               {parts.map(part => (
@@ -1013,13 +938,6 @@ export const register: Register = (on, rawOptions) => {
       </Box>
     )
 
-    return dialog ? (
-      <Box flexDirection="column">
-        {dialog}
-        {band}
-      </Box>
-    ) : (
-      band
-    )
+    return band
   })
 }
